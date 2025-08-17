@@ -4,7 +4,7 @@
 
 ## Overview
 
-StagDiDModels.jl implements some of the recent advances in difference-in-differences estimation that address heterogeneous treatment effects and violations of parallel trends. All estimators provide standard errors, model diagnostics, and are compatible with the StatsAPI ecosystem.
+StagDiDModels.jl implements some of the recent advances in difference-in-differences estimation that address heterogeneous treatment effects in staggered treatment adoption. All estimators provide standard errors, model diagnostics, and are compatible with the StatsAPI ecosystem.
 
 ## Available Estimators
 
