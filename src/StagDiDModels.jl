@@ -1,4 +1,4 @@
-module DiDModels
+module StagDiDModels
 
 using DataFrames
 using StatsAPI

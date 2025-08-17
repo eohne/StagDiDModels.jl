@@ -1,4 +1,4 @@
-name = "DiDModels"
+name = "StagDiDModels"
 uuid = "f3ca54ac-a19f-4bec-bcb5-33c111799ce9"
 authors = ["Elias Ohneberg <elias.ohneberg@gmail.com>"]
 version = "0.1.0"

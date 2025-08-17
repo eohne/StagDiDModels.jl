@@ -1,10 +1,10 @@
-# DiDModels.jl
+# StagDiDModels.jl
 
-Modern difference-in-differences estimators for Julia.
+(Some) modern staggered difference-in-differences estimators for Julia.
 
 ## Overview
 
-DiDModels.jl implements recent advances in difference-in-differences estimation that address heterogeneous treatment effects and violations of parallel trends. All estimators provide standard errors, model diagnostics, and are compatible with the StatsAPI ecosystem.
+StagDiDModels.jl implements some of the recent advances in difference-in-differences estimation that address heterogeneous treatment effects and violations of parallel trends. All estimators provide standard errors, model diagnostics, and are compatible with the StatsAPI ecosystem.
 
 ## Available Estimators
 
@@ -19,9 +19,9 @@ DiDModels.jl implements recent advances in difference-in-differences estimation 
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/eohne/DiDModels.jl")
+Pkg.add(url="https://github.com/eohne/StagDiDModels.jl")
 
-using DiDModels
+using StagDiDModels
 using DataFrames
 ```
 
