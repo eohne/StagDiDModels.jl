@@ -2,3 +2,6 @@
 ToDo
 .vscode
 Manifest.toml
+stata
+src/utils/aggregation.jl
+src/utils/preprocess old.jl

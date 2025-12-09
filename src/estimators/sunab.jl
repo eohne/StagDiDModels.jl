@@ -37,7 +37,7 @@ Sun—Abraham event study that **matches `fixest::sunab`** exactly.
 
 # Returns
 - If `agg=:dynamic`: `SunabModel` with coefficients `"τ::<τ>"`.
-- If `agg=:att`:     `SunabModel` with single `"ATT"` coefficient.
+- If `agg=:att`:     `SunabModel` with single `"_ATT"` coefficient.
 - If `agg=:both`:    `NamedTuple` `(dynamic=SunabModel, att=SunabModel)`.
 
 # Examples
@@ -291,7 +291,7 @@ function fit_sunab(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
         @warn "No post-treatment periods found for ATT calculation"
         att_β = [0.0]
         att_Σ = reshape([1.0], 1, 1)
-        att_names = ["ATT"]
+        att_names = ["_ATT"]
     else
         # Weight each post-τ by its total design matrix weight
         post_weights = Float64[]
@@ -316,7 +316,7 @@ function fit_sunab(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
         w_vec = zeros(length(β_dynamic))
         w_vec[post_τ_indices] = post_weights
         att_Σ = reshape([w_vec' * Σ_dynamic * w_vec], 1, 1)
-        att_names = ["ATT"]
+        att_names = ["_ATT"]
     end
     
     att_model = SunabModel(

@@ -9,7 +9,7 @@ struct TWFEModel <: RegressionModel
     nobs::Int                       # number of observations
     dof_resid::Int                  # residual degrees of freedom
     
-    # Gardner-specific diagnostics
+    # TWFE-specific diagnostics
     y_name::Symbol                  # outcome variable name
     estimator_type::Symbol          # :static or :dynamic
     treatment_periods::Vector{Int}  # event times estimated (empty for static)

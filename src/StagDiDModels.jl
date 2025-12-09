@@ -1,5 +1,6 @@
 module StagDiDModels
 
+using Logging # Turns of the printing of FixedEffectModels.jl 
 using DataFrames
 using StatsAPI
 using StatsModels
@@ -30,17 +31,20 @@ export responsename, coef, vcov, coefnames, nobs, dof_resiudual, dof, stderror, 
 # utils
 include("utils/preprocess.jl")
 include("utils/build_vcov.jl")
-include("utils/aggregation.jl")
 include("utils/fe_predict.jl")
 
 
 # estimators
 include("estimators/twfe.jl")
-include("estimators/did2s.jl")
+export fit_twfe_dynamic, fit_twfe_static
+include("estimators/gardner.jl")
+export fit_gardner_dynamic, fit_gardner_static
+# include("estimators/bjs_R.jl")
+# export fit_bjs, fit_bjs_dynamic, fit_bjs_static,fit_bjs_wild_bootstrap, fit_bjs_wild_bootstrap_mthreaded
 include("estimators/bjs.jl")
+export fit_bjs, fit_bjs_dynamic, fit_bjs_static
 include("estimators/sunab.jl")
-export fit_twfe_dynamic, fit_twfe_static, fit_gardner_dynamic, fit_gardner_static, fit_bjs, fit_bjs_dynamic, fit_bjs_static, fit_sunab, fit_bjs_wild_bootstrap, fit_bjs_wild_bootstrap_mthreaded
-
+export fit_sunab
 # post
 include("post/cumulative.jl")
 include("post/diagnostics.jl")

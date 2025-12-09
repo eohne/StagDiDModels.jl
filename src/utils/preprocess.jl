@@ -1,23 +1,3 @@
-# Return a sum of control Terms, or `nothing` if none
-_controls_term(controls::Vector{Symbol}) =
-    isempty(controls) ? nothing : sum(term.(controls))
-
-# Sum of FE terms from a tuple of Symbols (handles 0/1/2+ symbols)
-fe_terms(fe_syms::Tuple{Vararg{Symbol}}) =
-    isempty(fe_syms) ? nothing : reduce(+, (fe(s) for s in fe_syms))
-
-
-function add_terms(xs...)
-    terms = filter(!isnothing, collect(xs))
-    if isempty(terms)
-        return ConstantTerm(0)  # Return a proper term instead of 0
-    elseif length(terms) == 1
-        return terms[1]
-    else
-        return reduce(+, terms)
-    end
-end
-
 # Create event-time ttt = t - g
 function make_eventtime!(df::DataFrame; t::Symbol, g::Symbol, new::Symbol=:ttt,ref_p=-1)
     df[!, new] = df[!, t] .- df[!, g]
@@ -43,22 +23,6 @@ function bin_eventtime!(df::DataFrame; ttt::Symbol=:ttt, bin_leads::Union{Int,No
     return df
 end
 
-# Make ordered categorical with clean levels
-function factorize!(df::DataFrame, s::Symbol; stringy::Bool=true)
-    a = stringy ? string.(df[!, s]) : df[!, s]
-    df[!, s] = CategoricalArray(a; ordered=true)
-    levels!(df[!, s], sort!(unique(levels(df[!, s]))))
-    return df
-end
-
-# Simple support diagnostics per event-time
-function event_support(df::DataFrame; ttt::Symbol=:ttt, treated::Union{Symbol,Nothing}=nothing)
-    if isnothing(treated)
-        combine(groupby(df, ttt), nrow => :N)
-    else
-        combine(groupby(df, [ttt, treated]), nrow => :N)
-    end
-end
 
 # build sparse one-hot dummies for a vector (Int/String/Categorical ok)
 function _sparse_dummies(vec)

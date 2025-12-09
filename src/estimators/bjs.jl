@@ -1,1167 +1,1210 @@
+function quiet_reg(args...; kwargs...)
+    with_logger(SimpleLogger(stderr, Logging.Warn)) do
+        reg(args...; kwargs...)
+    end
+end
 """
-    build_wtr!(df; ttt::Symbol=:ttt, treat::Symbol=:__treat, weights::Union{Nothing,Symbol}=nothing,
-               horizons::Union{Nothing,Bool,Vector{Int}}=nothing, prefix::String="wtr")
+    update_weights_control_fixed!(W, x; donors, touse, wei)
 
-Creates treatment weights:
-- If `horizons === nothing` -> static ATT weights: a single column `\${prefix}treat` = 1{treated}.
-- If `horizons === true`    -> dynamic: one column per nonnegative event time present.
-- If `horizons::Vector{Int}`-> dynamic for those horizons (keeps τ ≥ 0 only).
-Weights are normalized to sum to 1 over treated rows, and (optionally) multiplied by `weights` before normalization.
-Returns the vector of created column Symbols, in order.
+Orthogonalize each column of W with respect to regressor x.
+Numerator sums over ALL observations, update applies only to donors.
 """
-function build_wtr!(df::DataFrame; ttt::Symbol=:ttt, treat::Symbol=:__treat,
-                    weights::Union{Nothing,Symbol}=nothing,
-                    horizons::Union{Nothing,Bool,Vector{Int}}=nothing,
-                    prefix::String="wtr")
+function update_weights_control_fixed!(
+    W::AbstractMatrix{<:Real},
+    x::AbstractVector{<:Real};
+    donors::AbstractVector{Bool},
+    touse::AbstractVector{Bool},
+    wei::AbstractVector{<:Real},
+    )
+    n, k = size(W)
+    
+    # denom = sum(wei * x^2) over DONORS only
+    denom = 0.0
+    @inbounds for i in 1:n
+        if donors[i] && touse[i]
+            denom += wei[i] * (x[i]^2)
+        end
+    end
+    
+    if denom <= 1e-14
+        return nothing
+    end
+    
+    @inbounds for j in 1:k
+        # Numerator: sum over ALL observations
+        num = 0.0
+        for i in 1:n
+            if touse[i]
+                num += wei[i] * W[i, j] * x[i]
+            end
+        end
+        β = num / denom
+        
+        # Update: only donors
+        for i in 1:n
+            if donors[i] && touse[i]
+                W[i, j] -= β * x[i]
+            end
+        end
+    end
+    
+    return nothing
+end
 
-    # base scalar weights
-    basew = isnothing(weights) ? ones(Float64, nrow(df)) : Float64.(df[!, weights])
+"""
+    update_weights_fe_fixed!(W, fe; donors, touse, wei)
 
-    if horizons === nothing
-        # Static case:
-        nm = Symbol(prefix * "static")
-        df[!, nm] = (df[!, treat] .== 1) .* basew
-        s = sum(df[!, nm])
-        if s > 0; df[!, nm] ./= s; end
-        return [nm]
-    else
-        # Dynamic case:
-        τvals = if horizons === true
-            unique(df[!, ttt])
-        else
-            collect(horizons)
+Orthogonalize each column of W with respect to FE dummies.
+Numerator sums over ALL observations, update applies only to donors.
+"""
+function update_weights_fe_fixed!(
+    W::AbstractMatrix{<:Real},
+    fe::AbstractVector;
+    donors::AbstractVector{Bool},
+    touse::AbstractVector{Bool},
+    wei::AbstractVector{<:Real},
+    )
+    n, k = size(W)
+    
+    # Build groups including ALL observations
+    groups_all = Dict{eltype(fe), Vector{Int}}()
+    @inbounds for i in 1:n
+        if touse[i]
+            g = fe[i]
+            if !haskey(groups_all, g)
+                groups_all[g] = Int[]
+            end
+            push!(groups_all[g], i)
         end
-        τkeep = sort!(unique(filter(≥(0), τvals)))
-        cols = Symbol[]
-        
-        for τ in τkeep
-            nm = Symbol(prefix * string(τ))
-            # R logic: weight = base_weight if ttt == τ, else 0
-            df[!, nm] = ifelse.(df[!, ttt] .== τ, basew, 0.0)
-            push!(cols, nm)
+    end
+    
+    # Precompute donor-only denominators
+    denom_g = Dict{eltype(fe), Float64}()
+    @inbounds for i in 1:n
+        if touse[i] && donors[i]
+            g = fe[i]
+            denom_g[g] = get(denom_g, g, 0.0) + wei[i]
+        end
+    end
+    
+    @inbounds for (g, all_idxs) in groups_all
+        dg = get(denom_g, g, 0.0)
+        if dg <= 1e-14
+            continue
         end
         
-        if isempty(cols)
-            @warn "No treatment weight columns created - no valid horizons found"
-            return Symbol[]
+        for j in 1:k
+            # Numerator: sum over ALL observations in group
+            num = 0.0
+            for i in all_idxs
+                num += wei[i] * W[i, j]
+            end
+            proj = num / dg
+            
+            # Update: only donors
+            for i in all_idxs
+                if donors[i]
+                    W[i, j] -= proj
+                end
+            end
         end
+    end
+    
+    return nothing
+end
+
+"""
+    compute_influence_weights_fixed!(df, wtr_syms, controls, fe_syms, D_sym, wei_sym; ...)
+
+Compute influence weights via iterative orthogonalization.
+"""
+function compute_influence_weights_fixed!(
+    df::DataFrame,
+    wtr_syms::Vector{Symbol},
+    controls::Vector{Symbol},
+    fe_syms::Vector{Symbol},
+    D_sym::Symbol,
+    wei_sym::Union{Nothing,Symbol};
+    touse_sym::Union{Nothing,Symbol}=nothing,
+    tol::Float64=1e-6,
+    maxiter::Int=1000,
+    )
+    n = nrow(df)
+    k = length(wtr_syms)
+    
+    D_vec = Int.(df[!, D_sym])
+    donors = D_vec .== 0
+    touse = touse_sym === nothing ? trues(n) : Bool.(df[!, touse_sym])
+    wei = isnothing(wei_sym) ? ones(Float64, n) : Float64.(df[!, wei_sym])
+    
+    # Initialize W with raw wtr columns
+    W = Array{Float64}(undef, n, k)
+    for (j, sym) in pairs(wtr_syms)
+        W[:, j] = Float64.(coalesce.(df[!, sym], 0.0))
+    end
+    
+    # Precompute demeaned controls
+    dm_controls = Dict{Symbol, Vector{Float64}}()
+    control_denoms = Dict{Symbol, Float64}()
+    
+    for c in controls
+        x = Float64.(df[!, c])
         
-        # normalization: each column sums to 1 over ALL observations
-        for c in cols
-            s = sum(df[!, c]; init=0.0)
-            if s > 0
-                df[!, c] ./= s
+        # Weighted mean among donors
+        num, den = 0.0, 0.0
+        @inbounds for i in 1:n
+            if donors[i] && touse[i]
+                num += wei[i] * x[i]
+                den += wei[i]
+            end
+        end
+        μ = den > 0 ? num / den : 0.0
+        x_dm = x .- μ
+        
+        # Denom = sum(wei * x_dm^2 | D==0 & touse)
+        denom = 0.0
+        @inbounds for i in 1:n
+            if donors[i] && touse[i]
+                denom += wei[i] * x_dm[i]^2
             end
         end
         
-        return cols
+        dm_controls[c] = x_dm
+        control_denoms[c] = denom
     end
+    
+    # Iterate until convergence
+    iter = 0
+    while iter < maxiter
+        iter += 1
+        W_old = copy(W)
+        
+        # 1) Simple controls
+        for c in controls
+            x_dm = dm_controls[c]
+            denom = control_denoms[c]
+            if denom <= 1e-14
+                continue
+            end
+            update_weights_control_fixed!(W, x_dm; donors=donors, touse=touse, wei=wei)
+        end
+        
+        # 2) Fixed effects
+        for fe in fe_syms
+            fe_vec = df[!, fe]
+            update_weights_fe_fixed!(W, fe_vec; donors=donors, touse=touse, wei=wei)
+        end
+        
+        # 3) Convergence check: SUM of absolute changes (matches Stata)
+        total_change = 0.0
+        @inbounds for j in 1:k
+            for i in 1:n
+                if donors[i] && touse[i]
+                    total_change += abs(W[i, j] - W_old[i, j])
+                end
+            end
+        end
+        
+        if total_change <= tol
+            break
+        end
+    end
+    
+    if iter == maxiter
+        @warn "compute_influence_weights_fixed!: did not converge within $maxiter iterations"
+    end
+    
+    return W, iter
+end
+
+"""
+    compute_cluster_scores_tau!(E_tau, d, wtr_syms, W, wei, cluster, g_sym, t_sym; ...)
+
+Compute cluster-level influence scores for treatment effects (tau).
+Returns matrix E where E[g,j] = cluster score for cluster g, coefficient j.
+"""
+function compute_cluster_scores_tau!(
+    d::DataFrame,
+    wtr_syms::Vector{Symbol},
+    W::Matrix{Float64},
+    wei::Vector{Float64},
+    cluster_vec::AbstractVector,
+    cluster_ids::Vector,
+    g_sym::Symbol,
+    t_sym::Symbol;
+    treat_sym::Symbol = :D,
+    avgeffectsby::Vector{Symbol} = Symbol[]
+    )
+    n, k = size(W)
+    G = length(cluster_ids)
+    
+    # Default avgeffectsby to (cohort, time)
+    if isempty(avgeffectsby)
+        avgeffectsby = [g_sym, t_sym]
+    end
+    
+    treated = d[!, treat_sym] .== 1
+    effect = Float64.(d[!, :effect])
+    
+    # Create avgeffectsby group identifier
+    avgby_vec = Vector{String}(undef, n)
+    for i in 1:n
+        key_parts = String[]
+        for s in avgeffectsby
+            push!(key_parts, string(d[i, s]))
+        end
+        avgby_vec[i] = join(key_parts, "_")
+    end
+    
+    # Pre-allocate influence scores
+    E = zeros(Float64, G, k)
+    
+    # Build cluster index mapping
+    cluster_idx_map = Dict{eltype(cluster_vec), Int}()
+    for (idx, g_val) in enumerate(cluster_ids)
+        cluster_idx_map[g_val] = idx
+    end
+    
+    # Compute resid0 for donors (Y - Y0)
+    resid0 = zeros(Float64, n)
+    for i in 1:n
+        if !treated[i]
+            resid0[i] = effect[i]  # effect = Y - Y0
+        end
+    end
+    
+    # Process each coefficient
+    for j in 1:k
+        wtrj = Float64.(coalesce.(d[!, wtr_syms[j]], 0.0))
+        w_infl = W[:, j]
+        
+        # Compute cluster weights within (cluster, avgeffectsby) groups
+        cw_key = Dict{Tuple{Any,String}, Float64}()
+        for i in 1:n
+            if treated[i] && wtrj[i] != 0
+                key = (cluster_vec[i], avgby_vec[i])
+                cw_key[key] = get(cw_key, key, 0.0) + wei[i] * wtrj[i]
+            end
+        end
+        
+        # Map to observation-level clusterweight
+        clusterweight = zeros(Float64, n)
+        for i in 1:n
+            if treated[i]
+                key = (cluster_vec[i], avgby_vec[i])
+                clusterweight[i] = get(cw_key, key, 0.0)
+            end
+        end
+        
+        # Compute smartdenom within avgeffectsby groups
+        smartdenom_by_avgby = Dict{String, Float64}()
+        for i in 1:n
+            if treated[i] && wtrj[i] != 0
+                key = avgby_vec[i]
+                smartdenom_by_avgby[key] = get(smartdenom_by_avgby, key, 0.0) + 
+                                            clusterweight[i] * wei[i] * wtrj[i]
+            end
+        end
+        
+        # Compute smart weights
+        smartweight = zeros(Float64, n)
+        for i in 1:n
+            if treated[i] && wtrj[i] != 0
+                sd = get(smartdenom_by_avgby, avgby_vec[i], 0.0)
+                if sd > 1e-14
+                    smartweight[i] = clusterweight[i] * wei[i] * wtrj[i] / sd
+                end
+            end
+        end
+        
+        # Compute avgtau within avgeffectsby groups
+        avgtau_by_avgby = Dict{String, Float64}()
+        for i in 1:n
+            if treated[i]
+                key = avgby_vec[i]
+                avgtau_by_avgby[key] = get(avgtau_by_avgby, key, 0.0) + 
+                                        effect[i] * smartweight[i]
+            end
+        end
+        
+        # Compute residuals
+        resid = zeros(Float64, n)
+        for i in 1:n
+            if treated[i]
+                avgtau_i = get(avgtau_by_avgby, avgby_vec[i], 0.0)
+                resid[i] = effect[i] - avgtau_i
+            else
+                resid[i] = resid0[i]
+            end
+        end
+        
+        # Compute cluster-level influence scores
+        for i in 1:n
+            g_idx = cluster_idx_map[cluster_vec[i]]
+            E[g_idx, j] += wei[i] * w_infl[i] * resid[i]
+        end
+    end
+    
+    return E
+end
+
+"""
+    compute_cluster_scores_pretrends!(...)
+
+Compute cluster-level influence scores for pre-trend coefficients.
+1. Run regression Y ~ controls + pre_dummies + FE on D==0, save residual
+2. For each pre_dummy: residualize on others + controls + FE
+3. Normalize weights, compute cluster scores
+"""
+function compute_cluster_scores_pretrends!(
+    d::DataFrame,
+    pre_syms::Vector{Symbol},
+    controls::Vector{Symbol},
+    fe::Tuple,
+    wei::Vector{Float64},
+    cluster_vec::AbstractVector,
+    cluster_ids::Vector,
+    cluster::Union{Nothing,Symbol},
+    weights::Union{Nothing,Symbol};
+    y::Symbol,
+    touse_sym::Symbol = :__touse
+    )
+    n = nrow(d)
+    k_pre = length(pre_syms)
+    G = length(cluster_ids)
+    
+    if k_pre == 0
+        return zeros(Float64, G, 0), Float64[], Int[]
+    end
+    
+    donors = d[!, :D] .== 0
+    touse = d[!, touse_sym]
+    donor_mask = donors .& touse
+    
+    # Build cluster index mapping
+    cluster_idx_map = Dict{eltype(cluster_vec), Int}()
+    for (idx, g_val) in enumerate(cluster_ids)
+        cluster_idx_map[g_val] = idx
+    end
+    
+    # Create donor subset with original row indices (copy to avoid modifying original)
+    donor_global_idx = findall(donor_mask)
+    d_donors = copy(d[donor_mask, :])
+    d_donors[!, :__orig_row] = donor_global_idx
+    n_donors = nrow(d_donors)
+    
+    # 1. Run pre-trend regression: Y ~ controls + pre_dummies + FE on D==0
+    fe_terms = sum(FixedEffectModels.fe.(fe))
+    pre_terms = sum(term.(pre_syms))
+    
+    if isempty(controls)
+        f_pre = Term(y) ~ pre_terms + fe_terms
+    else
+        control_terms = sum(term.(controls))
+        f_pre = Term(y) ~ control_terms + pre_terms + fe_terms
+    end
+    
+    m_pre = quiet_reg(d_donors, f_pre; weights=weights, save=:residuals,progress_bar=false)
+    
+    # Compute DOF adjustment exactly as Stata does (line 564 of did_imputation.ado)
+    # Stata: dof_adj = (e(N)-1)/(e(N)-e(df_m)-e(df_a)) * (e(N_clust)/(e(N_clust)-1))
+    #
+    # CRITICAL: Stata's reghdfe treats FE that are nested within the cluster as redundant
+    # for DOF computation. So if we cluster by `i` and have fe(i) + fe(t):
+    #   - Unit FE (i): ALL redundant (nested in cluster) = 0 DOF
+    #   - Time FE (t): X categories, 1 redundant = X-1 DOF
+    
+    N_pre = nobs(m_pre)
+    df_m_pre = dof(m_pre)  # Number of estimated coefficients (pre-trend dummies)
+    N_clust_pre = isnothing(cluster) ? N_pre : length(unique(d_donors[m_pre.esample, cluster]))
+    
+    # Compute df_a properly: only count FE that are NOT nested within the cluster
+    # FE nested in cluster contribute 0 to df_a
+    df_a_pre = 0
+    for fe_var in fe
+        fe_col = d_donors[m_pre.esample, fe_var]
+        n_levels = length(unique(fe_col))
+        
+        if isnothing(cluster)
+            # No clustering - all FE contribute normally (n_levels - 1)
+            df_a_pre += n_levels - 1
+        elseif fe_var == cluster
+            # This FE is the same as cluster variable - fully nested, contributes 0
+        else
+            # Check if this FE is nested within cluster
+            # (each FE level appears in only one cluster)
+            cluster_col = d_donors[m_pre.esample, cluster]
+            is_nested = true
+            fe_to_cluster = Dict{eltype(fe_col), Set{eltype(cluster_col)}}()
+            for (f, c) in zip(fe_col, cluster_col)
+                if !haskey(fe_to_cluster, f)
+                    fe_to_cluster[f] = Set{eltype(cluster_col)}()
+                end
+                push!(fe_to_cluster[f], c)
+                if length(fe_to_cluster[f]) > 1
+                    is_nested = false
+                    break
+                end
+            end
+            
+            if is_nested
+                # FE is nested within cluster - contributes 0 DOF
+            else
+                # FE is NOT nested - contributes (n_levels - 1) DOF
+                df_a_pre += n_levels - 1
+            end
+        end
+    end
+    
+    # Stata's formula
+    denom = N_pre - df_m_pre - df_a_pre
+    if denom <= 0
+        denom = 1
+    end
+    dof_adj_pre = ((N_pre - 1) / denom) * (N_clust_pre / max(N_clust_pre - 1, 1))
+    
+    # Get coefficients and identify valid (non-omitted) pre-trends
+    pre_coefnames = coefnames(m_pre)
+    pre_coefs_all = coef(m_pre)
+    pre_se_all = stderror(m_pre)
+    
+    pre_β = Float64[]
+    valid_pre_syms = Symbol[]
+    valid_pre_idx = Int[]
+    
+    for (j, sym) in enumerate(pre_syms)
+        idx = findfirst(==(String(sym)), pre_coefnames)
+        if idx !== nothing
+            b = pre_coefs_all[idx]
+            se = pre_se_all[idx]
+            # Omitted/collinear if: coef ≈ 0 AND (se ≈ 0 OR se is NaN/Inf)
+            is_omitted = abs(b) < 1e-10 && (abs(se) < 1e-10 || !isfinite(se))
+            if !is_omitted
+                push!(pre_β, b)
+                push!(valid_pre_syms, sym)
+                push!(valid_pre_idx, j)
+            end
+        end
+    end
+    # Warn about omitted pre-trends (rare, but possible)
+    omitted_pre = setdiff(pre_syms, valid_pre_syms)
+    if !isempty(omitted_pre)
+        @warn "Collinear pre-trends omitted: $(join(omitted_pre, ", "))"
+    end
+    k_valid = length(valid_pre_syms)
+    if k_valid == 0
+        return zeros(Float64, G, 0), Float64[], Int[]
+    end
+    
+    # 2. Get preresid and map back to full dataset using esample
+    preresid_raw = residuals(m_pre)
+    esample = m_pre.esample  # Boolean vector of length n_donors
+    
+    # Map residuals back to full dataset
+    preresid = zeros(Float64, n)
+    resid_idx = 0
+    for i in 1:n_donors
+        if esample[i]
+            resid_idx += 1
+            orig_row = d_donors[i, :__orig_row]
+            preresid[orig_row] = preresid_raw[resid_idx]
+        end
+    end
+    
+    # 4. For each valid pre-trend, compute influence weights and cluster scores
+    E_pre = zeros(Float64, G, k_valid)
+    
+    for (j, sym) in enumerate(valid_pre_syms)
+        pre_dummy = Float64.(d[!, sym])
+        
+        # Build list of other valid pre-trends
+        other_pre = filter(s -> s != sym, valid_pre_syms)
+        
+        # Residualize the pre-dummy on other pre-dummies + controls + FE
+        rhs_terms = []
+        if !isempty(controls)
+            push!(rhs_terms, sum(term.(controls)))
+        end
+        if !isempty(other_pre)
+            push!(rhs_terms, sum(term.(other_pre)))
+        end
+        
+        if isempty(rhs_terms)
+            f_resid = Term(sym) ~ fe_terms
+        else
+            f_resid = Term(sym) ~ reduce(+, rhs_terms) + fe_terms
+        end
+        
+        m_resid = quiet_reg(d_donors, f_resid, Vcov.simple(); weights=weights, save=:residuals,progress_bar=false)
+        preweight_raw = residuals(m_resid)
+        esample_resid = m_resid.esample
+        
+        # Map back to full dataset and multiply by wei
+        preweight = zeros(Float64, n)
+        resid_idx = 0
+        for i in 1:n_donors
+            if esample_resid[i]
+                resid_idx += 1
+                orig_row = d_donors[i, :__orig_row]
+                preweight[orig_row] = preweight_raw[resid_idx] * wei[orig_row]
+            end
+        end
+        
+        # Normalize: sum(preweight) where D==0 & touse & pretrendvar==1
+        norm_sum = 0.0
+        n_pre_obs = 0
+        for i in 1:n
+            if donor_mask[i] && pre_dummy[i] == 1.0
+                norm_sum += preweight[i]
+                n_pre_obs += 1
+            end
+        end
+        
+        if abs(norm_sum) > 1e-14
+            for i in 1:n
+                preweight[i] /= norm_sum
+            end
+        end
+        
+        # Compute cluster scores: egen eps = total(preweight * preresid) if touse, by(cluster)
+        for i in 1:n
+            if touse[i]
+                g_idx = cluster_idx_map[cluster_vec[i]]
+                E_pre[g_idx, j] += preweight[i] * preresid[i]
+            end
+        end
+        
+        # Apply DOF adjustment: Stata line 584
+        E_pre[:, j] .*= sqrt(dof_adj_pre)
+    end
+    
+    return E_pre, pre_β, valid_pre_idx
+end
+
+"""
+    compute_cluster_scores_controls!(...)
+
+Compute cluster scores for control variable coefficients.
+These use the first-stage imputation residual (Y - Y0 among donors).
+
+Follows Stata did_imputation.ado lines ~420-460.
+"""
+function compute_cluster_scores_controls!(
+    d::DataFrame,
+    controls::Vector{Symbol},
+    fe::Tuple,
+    wei::Vector{Float64},
+    cluster_vec::AbstractVector,
+    cluster_ids::Vector,
+    cluster::Union{Nothing,Symbol},
+    weights::Union{Nothing,Symbol},
+    imput_resid::Vector{Float64};  # First-stage residual (effect for donors, 0 for treated)
+    y::Symbol,
+    touse_sym::Symbol = :__touse
+    )
+    n = nrow(d)
+    k_ctrl = length(controls)
+    G = length(cluster_ids)
+    
+    if k_ctrl == 0
+        return zeros(Float64, G, 0), Float64[], Symbol[]
+    end
+    
+    donors = d[!, :D] .== 0
+    touse = d[!, touse_sym]
+    donor_mask = donors .& touse
+    
+    # Build cluster index mapping
+    cluster_idx_map = Dict{eltype(cluster_vec), Int}()
+    for (idx, g_val) in enumerate(cluster_ids)
+        cluster_idx_map[g_val] = idx
+    end
+    
+    # Create donor subset with original row indices
+    donor_global_idx = findall(donor_mask)
+    d_donors = copy(d[donor_mask, :])
+    d_donors[!, :__orig_row] = donor_global_idx
+    n_donors = nrow(d_donors)
+    
+    # Run first-stage regression to get control coefficients and DOF adjustment
+    fe_terms = sum(FixedEffectModels.fe.(fe))
+    if isempty(controls)
+        return zeros(Float64, G, 0), Float64[], Symbol[]
+    end
+    
+    control_terms = sum(term.(controls))
+    f_ctrl = Term(y) ~ control_terms + fe_terms
+    
+    m_ctrl = quiet_reg(d_donors, f_ctrl; weights=weights, save=:residuals,progress_bar=false)
+    
+    # Extract control coefficients
+    ctrl_coefnames = coefnames(m_ctrl)
+    ctrl_coefs_all = coef(m_ctrl)
+    ctrl_se_all = stderror(m_ctrl)
+    
+    # Compute DOF adjustment (same logic as pre-trends)
+    N_ctrl = nobs(m_ctrl)
+    df_m_ctrl = dof(m_ctrl)
+    N_clust_ctrl = isnothing(cluster) ? N_ctrl : length(unique(d_donors[m_ctrl.esample, cluster]))
+    
+    # Compute df_a accounting for nested FE
+    df_a_ctrl = 0
+    for fe_var in fe
+        fe_col = d_donors[m_ctrl.esample, fe_var]
+        n_levels = length(unique(fe_col))
+        
+        if isnothing(cluster)
+            df_a_ctrl += n_levels - 1
+        elseif fe_var == cluster
+            # FE same as cluster - contributes 0
+        else
+            # Check if nested
+            cluster_col = d_donors[m_ctrl.esample, cluster]
+            is_nested = true
+            fe_to_cluster = Dict{eltype(fe_col), Set{eltype(cluster_col)}}()
+            for (f, c) in zip(fe_col, cluster_col)
+                if !haskey(fe_to_cluster, f)
+                    fe_to_cluster[f] = Set{eltype(cluster_col)}()
+                end
+                push!(fe_to_cluster[f], c)
+                if length(fe_to_cluster[f]) > 1
+                    is_nested = false
+                    break
+                end
+            end
+            
+            if !is_nested
+                df_a_ctrl += n_levels - 1
+            end
+        end
+    end
+    
+    denom = N_ctrl - df_m_ctrl - df_a_ctrl
+    if denom <= 0
+        denom = 1
+    end
+    dof_adj_ctrl = ((N_ctrl - 1) / denom) * (N_clust_ctrl / max(N_clust_ctrl - 1, 1))
+    
+    # Get valid (non-omitted) controls
+    β_ctrl = Float64[]
+    valid_ctrl_syms = Symbol[]
+    valid_ctrl_idx = Int[]
+    
+    for (j, ctrl) in enumerate(controls)
+        idx = findfirst(==(String(ctrl)), ctrl_coefnames)
+        if idx !== nothing
+            b = ctrl_coefs_all[idx]
+            se = ctrl_se_all[idx]
+            # Omitted/collinear if: coef ≈ 0 AND (se ≈ 0 OR se is NaN/Inf)
+            is_omitted = abs(b) < 1e-10 && (abs(se) < 1e-10 || !isfinite(se))
+            if !is_omitted
+                push!(β_ctrl, b)
+                push!(valid_ctrl_syms, ctrl)
+                push!(valid_ctrl_idx, j)
+            end
+        end
+    end
+    # Warn about omitted controls
+    omitted_ctrls = setdiff(controls, valid_ctrl_syms)
+    if !isempty(omitted_ctrls)
+        @warn "Collinear controls omitted: $(join(omitted_ctrls, ", "))"
+    end
+    k_valid = length(valid_ctrl_syms)
+    if k_valid == 0
+        return zeros(Float64, G, 0), Float64[], Symbol[]
+    end
+    
+    # Compute cluster scores for each valid control
+    E_ctrl = zeros(Float64, G, k_valid)
+    
+    for (j, ctrl) in enumerate(valid_ctrl_syms)
+        ctrl_vec = Float64.(d[!, ctrl])
+        
+        # Build list of other valid controls
+        other_ctrl = filter(s -> s != ctrl, valid_ctrl_syms)
+        
+        # Residualize this control on other controls + FE (among donors)
+        if isempty(other_ctrl)
+            f_resid = Term(ctrl) ~ fe_terms
+        else
+            f_resid = Term(ctrl) ~ sum(term.(other_ctrl)) + fe_terms
+        end
+        
+        m_resid = quiet_reg(d_donors, f_resid, Vcov.simple(); weights=weights, save=:residuals,progress_bar=false)
+        ctrlweight_raw = residuals(m_resid)
+        esample_resid = m_resid.esample
+        
+        # Map back to full dataset and multiply by wei
+        ctrlweight = zeros(Float64, n)
+        resid_idx = 0
+        for i in 1:n_donors
+            if esample_resid[i]
+                resid_idx += 1
+                orig_row = d_donors[i, :__orig_row]
+                ctrlweight[orig_row] = ctrlweight_raw[resid_idx] * wei[orig_row]
+            end
+        end
+        
+        # Normalize: Stata uses sum(ctrlweight * ctrl) where D==0 & touse
+        # This is sum(ctrlweight_product)
+        norm_sum = 0.0
+        for i in 1:n
+            if donor_mask[i]
+                norm_sum += ctrlweight[i] * ctrl_vec[i]
+            end
+        end
+        
+        if abs(norm_sum) > 1e-14
+            for i in 1:n
+                ctrlweight[i] /= norm_sum
+            end
+        end
+        
+        # Compute cluster scores: sum(ctrlweight * imput_resid) by cluster
+        for i in 1:n
+            if touse[i]
+                g_idx = cluster_idx_map[cluster_vec[i]]
+                E_ctrl[g_idx, j] += ctrlweight[i] * imput_resid[i]
+            end
+        end
+        
+        # Apply DOF adjustment
+        E_ctrl[:, j] .*= sqrt(dof_adj_ctrl)
+    end
+    
+    return E_ctrl, β_ctrl, valid_ctrl_syms
 end
 
 
 """
-    fit_bjs(df; y, id, t, g;
-                       controls = Symbol[],
-                       fe::Tuple = (id, t),
-                       weights::Union{Nothing,Symbol} = nothing,
-                       cluster::Union{Nothing,Symbol} = nothing,
-                       horizons::Union{Nothing,Bool,Vector{Int}} = nothing,
-                       pretrends::Union{Nothing,Bool,Vector{Int}} = nothing,
-                       control_type::Symbol = :notyet)
+    fit_bjs(df::DataFrame;
+        y::Symbol,
+        id::Symbol,
+        t::Symbol,
+        g::Symbol,
+        controls::Vector{Symbol} = Symbol[],
+        fe::Tuple = (id, t),
+        weights::Union{Nothing,Symbol} = nothing,
+        cluster::Union{Nothing,Symbol} = nothing,
+        horizons::Union{Nothing,Bool,Vector{Int}} = nothing,
+        pretrends::Union{Nothing,Bool,Int,Vector{Int}} = nothing,
+        avgeffectsby::Union{Nothing,Vector{Symbol}} = nothing,
+        control_type::Symbol = :notyet,
+        tol::Float64 = 1e-6,
+        maxiter::Int = 1000)
 
-BJS **imputation** estimator (static or dynamic) with optional pretrend testing, 
-following Borusyak, Jaravel, and Spiess (2021).
+Estimate treatment effects using the Borusyak, Jaravel, and Spiess (2023) 
+imputation estimator for staggered adoption designs. This implementation 
+follows the logic of the official Stata `did_imputation` command, including 
+its analytic influence-function variance estimation.
 
-# Description
-
-The imputation-based estimator is a method of calculating treatment effects
-in a difference-in-differences framework. The method estimates a model for
-Y(0) using untreated/not-yet-treated observations and predicts Y(0) for the
-treated observations ŷ(0). The difference between treated and
-predicted untreated outcomes Y(1) - ŷ(0) serves as an estimate
-for the treatment effect for unit i in period t. These are then averaged to
-form average treatment effects for groups of {it}.
+Supports static ATT estimation, dynamic event-study effects, 
+pre-trend coefficients, and control variables with proper joint VCOV.
 
 # Arguments
-
-- `df::DataFrame`: Panel dataset
-- `y::Symbol`: Outcome variable name
-- `id::Symbol`: Unit identifier variable name  
-- `t::Symbol`: Time period variable name
-- `g::Symbol`: Treatment timing variable name (when unit first receives treatment)
+- `df::DataFrame`: Long panel dataset in (i,t) format.
+- `y::Symbol`: Outcome variable.
+- `id::Symbol`: Unit (e.g. firm, fund) identifier.
+- `t::Symbol`: Time period identifier (integer-coded).
+- `g::Symbol`: First treatment period for each unit. Missing values indicate never-treated units.
 
 # Keyword Arguments
 
-- `controls::Vector{Symbol}=Symbol[]`: Control variables to include in first stage
-- `fe::Tuple=(id, t)`: Fixed effects to include in first stage (default: unit and time FE)
-- `weights::Union{Nothing,Symbol}=nothing`: Observation weights variable name
-- `cluster::Union{Nothing,Symbol}=nothing`: Clustering variable (default: clusters by `id`)
-- `horizons::Union{Nothing,Bool,Vector{Int}}=nothing`: Event study horizons to estimate
-  - `nothing`: Static ATT estimation
-  - `true`: All available post-treatment periods (τ ≥ 0)  
-  - `Vector{Int}`: Specific horizons to estimate
-- `pretrends::Union{Nothing,Bool,Vector{Int}}=nothing`: Pre-treatment periods for testing
-  - `nothing` or `false`: No pretrend testing
-  - `true`: All available pre-treatment periods (τ < 0)
-  - `Vector{Int}`: Specific pre-treatment periods to test
-- `control_type::Symbol=:notyet`: Donor sample definition
-  - `:notyet`: Not-yet-treated + never-treated units
-  - `:never`: Never-treated units only
+- `controls::Vector{Symbol}`: Time-varying covariates included in the imputation regression. Control coefficients are included in the output with proper SEs.
+- `fe::Tuple = (id, t)`: Absorbed fixed effects. Default is unit + time FE.
+- `weights::Union{Nothing,Symbol}`: Optional observation weights.
+- `cluster::Union{Nothing,Symbol}`: Clustering variable for standard errors. If `nothing`, heteroskedastic-robust SEs are used.
+- `horizons::Union{Nothing,Bool,Vector{Int}}`: Controls dynamic vs. static estimation:
+    - `nothing` → static ATT (single coefficient)
+    - `true` → estimate all post-treatment horizons (τ ≥ 0)  
+    - `Vector{Int}` → estimate only selected horizons (e.g., `[0,1,2,3,4,5]`)
+- `pretrends::Union{Nothing,Bool,Int,Vector{Int}}`: Pre-trend coefficients:
+    - `nothing` or `false` → no pre-trend terms  
+    - `true` → all negative horizons (τ < 0)
+    - `Int` → number of pre-periods (e.g., `5` means K=-1 to K=-5)
+    - `Vector{Int}` → specific pre-horizons
+- `avgeffectsby::Union{Nothing,Vector{Symbol}}`: Grouping variables for averaging treatment effects in the variance calculation. Default is `[g, t]` (cohort x time), matching Stata's default behavior.
+- `control_type::Symbol = :notyet`: Donor pool definition (not yet implemented, currently always uses not-yet-treated + never-treated).
+- `tol::Float64 = 1e-6`: Convergence tolerance for influence weight iteration.
+- `maxiter::Int = 1000`: Maximum iterations for influence weight computation.
 
-# Data Conventions
+# Output
 
-Never-treated units must be coded as `g == 0` or `g == missing`.
-Do NOT use `Inf` or out-of-sample dates for never-treated units.
+Returns a `BJSModel` object.
 
-# Implementation Details
+Supports the `StatsAPI` interface: `coef`, `vcov`, `stderror`, `coefnames`, 
+`confint`, `pvalue`, `nobs`, `dof_residual`, `r2` (only the first stage r2 is available).
 
-1. **First Stage**: Estimates Y(0) using donor observations via fixest-style FE regression
-2. **Prediction**: Uses robust `fe_predict` that handles missing FE levels gracefully  
-3. **Treatment Effects**: Computes weighted averages of Y(1) - ŷ(0) for treated observations
-4. **Standard Errors**: Analytic influence function approach exactly matching R `didimputation`
+# Notes
 
-The implementation produces identical results to the R `didimputation` package.
-
-# Returns
-
-`SimpleModel` containing:
-- Point estimates (static ATT or event study coefficients)
-- Analytic standard errors with cluster-robust inference
-- Compatible with all `StatsAPI` functions (`coef`, `vcov`, `coefnames`, etc.)
-
-# Examples
-
-```julia
-# Static ATT estimation
-static_model = fit_bjs(df; y=:outcome, id=:unit, t=:year, g=:treatment_year)
-
-# Dynamic event study (all post periods)  
-dynamic_model = fit_bjs(df; y=:outcome, id=:unit, t=:year, g=:treatment_year,
-                                   horizons=true, cluster=:state)
-
-# Event study with pretrends testing
-full_model = fit_bjs(df; y=:outcome, id=:unit, t=:year, g=:treatment_year,
-                                horizons=0:5, pretrends=[-3,-2,-1], 
-                                controls=[:covariate1, :covariate2],
-                                cluster=:state)
-
-# Access results
-coef(dynamic_model)                    # Point estimates
-sqrt.(diag(vcov(dynamic_model)))       # Standard errors  
-coefnames(dynamic_model)               # Coefficient names
-```
-
-# References
-
-Borusyak, K., Jaravel, X., & Spiess, J. (2021). Revisiting event study designs: 
-Robust and efficient estimation. Working paper.
+- Never-treated units: code as `missing` in `g`
+- Time variable must be integer-coded
 """
-function fit_bjs(df::DataFrame; 
-                            y::Symbol, 
-                            id::Symbol, t::Symbol, g::Symbol,
-                            controls::Vector{Symbol}=Symbol[],
-                            fe::Tuple{Vararg{Symbol}}=(id, t),
-                            weights::Union{Nothing,Symbol}=nothing,
-                            cluster::Union{Nothing,Symbol}=id,
-                            horizons::Union{Nothing,Bool,Vector{Int}}=nothing,
-                            pretrends::Union{Nothing,Bool,Vector{Int}}=nothing,
-                            control_type::Symbol=:notyet)
-
-    d = copy(df)
-    d[ismissing.(d[!, g]), g] .= 0
+function fit_bjs(df::DataFrame;
+    y::Symbol,
+    id::Symbol,
+    t::Symbol,
+    g::Symbol,
+    controls::Vector{Symbol} = Symbol[],
+    fe::Tuple = (id, t),
+    weights::Union{Nothing,Symbol} = nothing,
+    cluster::Union{Nothing,Symbol} = nothing,
+    horizons::Union{Nothing,Bool,Vector{Int}} = nothing,
+    pretrends::Union{Nothing,Bool,Int,Vector{Int}} = nothing,
+    avgeffectsby::Union{Nothing,Vector{Symbol}} = nothing,
+    control_type::Symbol = :notyet,
+    tol::Float64 = 1e-6,
+    maxiter::Int = 1000
+    )
+    # Default avgeffectsby to (cohort, time)
+    if avgeffectsby === nothing
+        avgeffectsby = [g, t]
+    end
     
-    # Missing data handling
-    key_vars = [y, id, t, g]
+    #=== 0. Copy and clean data ===#
+    d = copy(df)
+    
+    key_vars = Symbol[y, id, t]
+    append!(key_vars, controls)
     if !isnothing(weights); push!(key_vars, weights); end
     if !isnothing(cluster); push!(key_vars, cluster); end
-    append!(key_vars, controls)
-    append!(key_vars, collect(fe))
     key_vars = unique(key_vars)
     
-    missing_mask = falses(nrow(d))
-    for var in key_vars
-        missing_mask .|= ismissing.(d[!, var])
+    miss = falses(nrow(d))
+    for v in key_vars
+        miss .|= ismissing.(d[!, v])
+    end
+    if any(miss)
+        d = d[.!miss, :]
     end
     
-    if any(missing_mask)
-        d = d[.!missing_mask, :]
-    end
-
     n = nrow(d)
-    if n == 0
-        error("No observations remaining after dropping missing values")
+    n == 0 && error("No observations left after dropping missings.")
+    
+    d[!, :__touse] = trues(n)
+    
+    #=== 1. Event time K and treatment indicator D ===#
+    K = Vector{Union{Int,Missing}}(undef, n)
+    for i in 1:n
+        gi = d[i, g]
+        K[i] = ismissing(gi) ? missing : d[i, t] - gi
     end
-
-    # Treatment indicator and event time
-    treat = (.!ismissing.(d[!, g])) .& (d[!, g] .> 0) .& (d[!, t] .>= d[!, g])
-    d[!, :__treat] = Int.(treat)
-    make_eventtime!(d; t=t, g=g, new=:ttt, ref_p=-1_000_000)
-
-    # Get list of event times
-    event_times = sort(unique(d[d[!, :ttt] .!= -1_000_000, :ttt]))
-
-    # First stage on donors only
-    donors = donor_mask(d; t=t, g=g, control_type=control_type)
-
-    if sum(donors) == 0
-        error("No donor observations found for first stage estimation")
+    d[!, :K] = K
+    
+    D = Vector{Int}(undef, n)
+    for i in 1:n
+        D[i] = ismissing(K[i]) ? 0 : (K[i] >= 0 ? 1 : 0)
     end
-
-    w_vec = isnothing(weights) ? nothing : Float64.(d[!, weights])
-
-    # Build first stage formula
-    if isempty(controls)
-        fe_terms_sum = reduce(+, [FixedEffectModels.fe(s) for s in fe])
-        f1 = Term(y) ~ fe_terms_sum
-    else
-        control_terms = sum(term.(controls))
-        fe_terms_sum = reduce(+, [FixedEffectModels.fe(s) for s in fe])
-        f1 = Term(y) ~ control_terms + fe_terms_sum
+    d[!, :D] = D
+    
+    donors = D .== 0
+    n_donors = count(donors)
+    n_treated = n - n_donors
+    n_donors == 0 && error("No donor observations.")
+    
+    #=== 2. Observation weights ===#
+    wei = isnothing(weights) ? ones(Float64, n) : Float64.(d[!, weights])
+    
+    #=== 3. First-stage regression ===#
+    fe_terms = sum(FixedEffectModels.fe.(fe))
+    f1 = isempty(controls) ? 
+         Term(y) ~ fe_terms : 
+         Term(y) ~ sum(term.(controls)) + fe_terms
+    
+    m1 = quiet_reg(d[donors, :], f1; weights=weights, save=:all,progress_bar=false)  # save=:all to get residuals
+    r2_1 = FixedEffectModels.r2(m1)
+    
+    # Save first-stage imputation residual (needed for control SEs)
+    # This is Y - Y0 among donors, will be 0 for treated
+    imput_resid_raw = residuals(m1)
+    esample_m1 = m1.esample
+    imput_resid = zeros(Float64, nrow(d))
+    donor_indices = findall(donors)
+    resid_idx = 0
+    for (i, donor_i) in enumerate(donor_indices)
+        if esample_m1[i]
+            resid_idx += 1
+            imput_resid[donor_i] = imput_resid_raw[resid_idx]
+        end
     end
     
-    # Fit first stage model
-    m1 = reg(d[donors, :], f1, Vcov.robust(); 
-             weights = weights === nothing ? nothing : weights,
-             save = :fe)
-    
-    # Y(0) prediction
+    #=== 4. Predict Y0 and compute effect ===#
     y0hat = fe_predict(m1, d)
+    d[!, :Y0_hat] = y0hat
     
-    # Handle any missing predictions
-    if any(ismissing, y0hat)
-        y0hat = coalesce.(y0hat, 0.0)
-    end
+    eff = Float64.(d[!, y]) .- Float64.(y0hat)
+    d[!, :effect] = eff
     
-    y0hat = Float64.(y0hat)
-
-    # Create adjusted outcome
-    d[!, :__adj] = Float64.(d[!, y]) .- y0hat
-    
-    # Drop rows with missing adjusted outcomes
-    adj_missing = ismissing.(d[!, :__adj])
-    if any(adj_missing)
-        d = d[.!adj_missing, :]
-        treat = treat[.!adj_missing]
+    # Handle missing Y0
+    keep = .!ismissing.(y0hat)
+    if any(.!keep)
+        d = d[keep, :]
+        imput_resid = imput_resid[keep]  # Keep residuals aligned with data
         n = nrow(d)
-        if !isnothing(w_vec); w_vec = w_vec[.!adj_missing]; end
+        wei = isnothing(weights) ? ones(Float64, n) : Float64.(d[!, weights])
+        D = d[!, :D]
+        K = d[!, :K]
+        donors = D .== 0
+        n_donors = count(donors)
+        n_treated = n - n_donors
+        eff = d[!, :effect]
     end
-
-    if n == 0
-        error("No observations remaining after adjustment")
-    end
-
-    # Main BJS estimation (treatment effects)
-    main_β = Float64[]
-    main_Σ = Matrix{Float64}(undef, 0, 0)
-    main_names = String[]
-    treat_mask = d[!, :__treat] .== 1
-    if horizons !== nothing || isnothing(pretrends)
-        # Build treatment weights
-        wtr_syms = build_wtr!(d; ttt=:ttt, treat=:__treat, weights=weights, 
-                              horizons=horizons, prefix="__wtr")
-        k = length(wtr_syms)
+    
+    # Store imput_resid in dataframe for later use
+    d[!, :__imput_resid] = imput_resid
+    
+    #=== 5. Construct wtr weights for tau ===#
+    wtr_syms = Symbol[]
+    if horizons === nothing || horizons === false
+        push!(wtr_syms, :__wtr_static)
+        d[!, :__wtr_static] = Float64.(D .== 1)
+        s = sum(wei[i] * d[i, :__wtr_static] for i in 1:n if D[i] == 1)
+        s > 0 && (d[!, :__wtr_static] ./= s)
+    else
+        τvals = horizons === true ? 
+                unique(filter(!ismissing, K[D .== 1])) : 
+                collect(horizons)
+        τvals = sort(unique(filter(≥(0), τvals)))
         
-        if k > 0
-            WTR = reduce(hcat, (Float64.(d[!, s]) for s in wtr_syms))  # n × k
-            
-            # Point estimates - use only treated observations
-            treat_mask = d[!, :__treat] .== 1
-            
-            if sum(treat_mask) == 0
-                error("No treated observations found for estimation")
-            end
-            
-            WTR_treated = WTR[treat_mask, :]
-            adj_treated = Float64.(d[treat_mask, :__adj])
-
-            # Point estimates using R formula
-            main_β = vec(sum(WTR_treated .* adj_treated, dims=1))
-            
-            # Analytic SEs (BJS influence function)
-            idx1 = findall(treat_mask)
-            idx0 = findall(.!treat_mask)
-
-            if isempty(idx1)
-                error("No treated observations found")
-            end
-            if isempty(idx0)
-                error("No untreated observations found")
-            end
-
-            # Build design matrix for first stage
-            if isempty(controls)
-                Z = sparse_rhs_fe(d; controls=Symbol[], fe=fe)
-            else
-                Z = sparse_rhs_fe(d; controls=controls, fe=fe)
-            end
-
-            # Weight vector for influence function
-            wdat = isnothing(w_vec) ? ones(Float64, n) : Float64.(w_vec)
-            Zw  = spdiagm(0 => wdat) * Z
-            Z1w = Zw[idx1, :]
-            Z0w = Zw[idx0, :]
-
-            # Cross-products
-            S_Z0Z0 = Matrix(Z0w' * Z0w)
-
-            WTR1 = WTR[idx1, :]
-            Z1_wtr = Matrix(Z1w' * WTR1)
-
-            # v* = -Z * (S_Z0Z0 \ (Z1' WTR1))  # match R::solve(S_Z0Z0, Z1_wtr)
-            vstar = - Matrix(Zw * (S_Z0Z0 \ Z1_wtr))
-
-
-            # Fix v* on treated rows: set equal to WTR
-            vstar[idx1, :] .= WTR1
-
-
-            # Add vstar columns to dataframe 
-            for j in 1:k
-                d[!, Symbol("zz000v$j")] = vstar[:, j]
-            end
-
-            vcols = [Symbol("zz000v$j") for j in 1:k]
-            tcols = [Symbol("zz000tau_et$j") for j in 1:k]
-
-            # Initialize tau_et columns
-            for j in 1:k
-                d[!, tcols[j]] = zeros(Float64, nrow(d))
-            end
-
-            # Calculate group means BY (g, event_time) and assign properly
-            for group_df in groupby(d, [g, :ttt])
-                if nrow(group_df) == 0; continue; end
-                
-                g_val = group_df[1, g]
-                τ_val = group_df[1, :ttt]
-                group_mask = (d[!, g] .== g_val) .& (d[!, :ttt] .== τ_val)
-                
-                for j in 1:k
-                    x = d[group_mask, vcols[j]]
-                    adj_vals = d[group_mask, :__adj]
-                    treat_vals = d[group_mask, :__treat]
-                    
-                    # R formula: sum(x^2 * adj) / sum(x^2) * treat
-                    numerator = sum(x.^2 .* adj_vals)
-                    denominator = sum(x.^2)
-                    
-                    if denominator > eps()
-                        group_mean_base = numerator / denominator
-                        group_values = group_mean_base .* treat_vals
-                    else
-                        group_values = zeros(sum(group_mask))
-                    end
-                    
-                    d[group_mask, tcols[j]] = group_values
+        for τ in τvals
+            nm = Symbol("__wtr$(τ)")
+            push!(wtr_syms, nm)
+            col = zeros(Float64, n)
+            for i in 1:n
+                if D[i] == 1 && !ismissing(K[i]) && K[i] == τ
+                    col[i] = 1.0
                 end
             end
-
-            # Recenter: adj - τ̄_{et}
-            for j in 1:k
-                tau_vals = d[!, tcols[j]]
-                tau_vals[ismissing.(tau_vals)] .= 0.0
-                d[!, tcols[j]] = d[!, :__adj] .- tau_vals
-            end
-
-            # Cluster variance calculation - EXACT R approach
-            cl = isnothing(cluster) ? d[!, id] : d[!, cluster]
-            cluster_contributions = zeros(length(unique(cl)), k)
-            cluster_ids = unique(cl)
-
-            for (c_idx, c_id) in enumerate(cluster_ids)
-                cluster_mask = cl .== c_id
-                cluster_data = d[cluster_mask, :]
-                
-                for j in 1:k
-                    v_col = cluster_data[!, vcols[j]]
-                    tau_col = cluster_data[!, tcols[j]]
-                    cluster_sum = sum(v_col .* tau_col)
-                    cluster_contributions[c_idx, j] = cluster_sum^2
-                end
-            end
-
-            # Standard errors: sqrt(sum(x)) across clusters
-            ses = sqrt.(sum(cluster_contributions, dims=1))[:]
-            main_Σ = Diagonal(ses.^2)
-
-            # Clean up temporary columns
-            for j in 1:k
-                select!(d, Not(vcols[j]))
-                select!(d, Not(tcols[j]))
-            end
-            
-            # Build main coefficient names
-            main_names = if horizons === nothing
-                ["_ATT"]
-            else
-                τkeep = parse.(Int, replace.(String.(wtr_syms), "__wtr" => ""))
-                "τ::" .* string.(τkeep)
-            end
+            s = sum(wei[i] * col[i] for i in 1:n)
+            s > 0 && (col ./= s)
+            d[!, nm] = col
         end
     end
-
-    # Pretrend estimation (TWFE on untreated)
-    pre_β = Float64[]
-    pre_Σ = Matrix{Float64}(undef, 0, 0)
-    pre_names = String[]
-
-    if !isnothing(pretrends) && pretrends !== false
-        # determine which negative τ’s to keep (exactly like R’s keep=…)
-        pretrend_periods = pretrends === true ? filter(τ -> τ < 0, event_times) : filter(τ -> τ < 0, pretrends)
-
-        if !isempty(pretrend_periods)
-            d_untreated = d[.!treat_mask, :]
-            if nrow(d_untreated) > 0
-                # 1) build explicit indicator columns ONLY for the requested τ’s
-                #    (mimics fixest::i(zz000event_time, keep = pretrend_periods))
-                pre_syms = Symbol[]
-                for τ in pretrend_periods
-                    s = Symbol("__pre_", τ)            # e.g., __pre_-5
-                    push!(pre_syms, s)
-                    d_untreated[!, s] = Float64.(d_untreated[!, :ttt] .== τ)
-                end
-
-                # 2) construct RHS = sum of kept dummies + controls + FE
-                control_terms = isempty(controls) ? nothing : sum(term.(controls))
-                fe_terms_sum  = length(fe) == 0 ? nothing : reduce(+, [FixedEffectModels.fe(s) for s in fe])
-                pre_terms_sum = sum(term.(pre_syms))  # sum of explicit τ dummies
-
-                rhs_list = Any[pre_terms_sum]
-                if control_terms !== nothing; push!(rhs_list, control_terms); end
-                if fe_terms_sum  !== nothing; push!(rhs_list, fe_terms_sum);  end
-                rhs_pre = reduce(+, rhs_list)
-
-                f_pre = Term(y) ~ rhs_pre
-                cluster_vcov = build_cluster_vcov(isnothing(cluster) ? id : cluster)
-                w_untreated = isnothing(w_vec) ? nothing : w_vec[.!treat_mask]
-
-                pre_est = reg(d_untreated, f_pre, cluster_vcov;weights = weights)
-
-                
-                cn       = StatsAPI.coefnames(pre_est)
-                coefs    = StatsAPI.coef(pre_est)
-                vcov_mat = StatsAPI.vcov(pre_est)
-
-                # map symbol -> column index
-                idx_map = Dict{Symbol, Int}()
-                for (i, nm) in pairs(cn)
-                    try
-                        idx_map[Symbol(nm)] = i
-                    catch
-                        # ignore non-symbol names (e.g., FE)
-                    end
-                end
-
-                pre_indices = [ get(idx_map, Symbol("__pre_", τ), nothing) for τ in pretrend_periods ]
-                # drop τ’s that didn’t appear in untreated data (no column created)
-                keep_mask = map(!isnothing, pre_indices)
-                pre_indices = collect(skipmissing(pre_indices))
-
-                if !isempty(pre_indices)
-                    pre_β = coefs[pre_indices]
-                    pre_Σ = vcov_mat[pre_indices, pre_indices]
-                    pre_names = ["τ::$(τ)" for (τ, keep) in zip(pretrend_periods, keep_mask) if keep]
-                end
-
+    k_tau = length(wtr_syms)
+    
+    #=== 6. Point estimates for tau ===#
+    β_tau = zeros(Float64, k_tau)
+    for j in 1:k_tau
+        wname = wtr_syms[j]
+        s = 0.0
+        for i in 1:n
+            if D[i] == 1
+                s += eff[i] * d[i, wname] * wei[i]
             end
         end
-    end
-
-
-    # Combine results and order by τ
-    if isempty(pre_β) && isempty(main_β)
-        error("No coefficients estimated")
+        β_tau[j] = s
     end
     
-    all_β = vcat(pre_β, main_β)
-    all_names = vcat(pre_names, main_names)
+    #=== 7. Construct pre-trend dummies ===#
+    pre_syms = Symbol[]
+    pre_horizons = Int[]
     
-    # Build combined covariance matrix (block diagonal)
-    k_pre = length(pre_β)
-    k_main = length(main_β)
-    k_total = k_pre + k_main
+    if pretrends !== nothing && pretrends !== false
+        if pretrends === true
+            # All negative horizons among treated before treatment
+            all_neg = sort(unique(filter(<(0), filter(!ismissing, K))), rev=true)  # -1, -2, -3, ...
+            pre_horizons = all_neg
+        elseif pretrends isa Int
+            # pretrends(5) means pre1 (K=-1), pre2 (K=-2), ..., pre5 (K=-5)
+            # Stata: forvalues h = 1/`pretrends' { gen pretrendvar`h' = (K==-`h') }
+            pre_horizons = collect(-1:-1:-pretrends)  # [-1, -2, -3, -4, -5]
+        else
+            pre_horizons = sort(collect(pretrends), rev=true)  # sort descending (closest to 0 first)
+        end
+        pre_horizons = filter(<(0), pre_horizons)
+        
+        # Create pre-trend dummies: pre1 for K=-1, pre2 for K=-2, etc.
+        for τ in pre_horizons
+            nm = Symbol("pre$(abs(τ))")
+            push!(pre_syms, nm)
+            col = zeros(Float64, n)
+            for i in 1:n
+                if !ismissing(K[i]) && K[i] == τ
+                    col[i] = 1.0
+                end
+            end
+            d[!, nm] = col
+        end
+    end
     
-    Σ_combined = zeros(k_total, k_total)
+    #=== 8. Compute influence weights for tau ===#
+    fe_syms = Symbol[fe...]
+    W_tau, iters = compute_influence_weights_fixed!(
+        d, wtr_syms, controls, fe_syms, :D, weights;
+        touse_sym = :__touse,
+        tol = tol,
+        maxiter = maxiter,
+    )
+    
+    #=== 9. Setup cluster structure ===#
+    cluster_vec = isnothing(cluster) ? collect(1:n) : d[!, cluster]
+    cluster_ids = unique(cluster_vec)
+    G = length(cluster_ids)
+    
+    #=== 10. Compute cluster scores for tau ===#
+    E_tau = compute_cluster_scores_tau!(
+        d, wtr_syms, W_tau, wei, cluster_vec, cluster_ids, g, t;
+        treat_sym = :D,
+        avgeffectsby = avgeffectsby
+    )
+    
+    #=== 11. Compute cluster scores for pre-trends ===#
+    E_pre, β_pre, valid_pre_idx = compute_cluster_scores_pretrends!(
+        d, pre_syms, controls, fe, wei, cluster_vec, cluster_ids, cluster, weights;
+        y = y,
+        touse_sym = :__touse
+    )
+    k_pre = length(β_pre)
+    
+    #=== 11b. Compute cluster scores for controls ===#
+    E_ctrl, β_ctrl, valid_ctrl_syms = compute_cluster_scores_controls!(
+        d, controls, fe, wei, cluster_vec, cluster_ids, cluster, weights, 
+        d[!, :__imput_resid];
+        y = y,
+        touse_sym = :__touse
+    )
+    k_ctrl = length(β_ctrl)
+    
+    #=== 12. Combine cluster scores and compute joint VCOV ===#
+    # Stata order: [pre-trends, tau, controls]
+    # Pre-trends in chronological order: pre5, pre4, pre3, pre2, pre1
+    
     if k_pre > 0
-        Σ_combined[1:k_pre, 1:k_pre] = pre_Σ
-    end
-    if k_main > 0
-        Σ_combined[(k_pre+1):k_total, (k_pre+1):k_total] = main_Σ
+        # Pre-trends are in order: pre1 (K=-1), pre2 (K=-2), ...
+        # We want chronological: pre5 (K=-5), pre4 (K=-4), ..., pre1 (K=-1)
+        # So we need to reverse the order
+        E_pre_chron = E_pre[:, end:-1:1]
+        β_pre_chron = β_pre[end:-1:1]
+        valid_pre_idx_chron = valid_pre_idx[end:-1:1]
+    else
+        E_pre_chron = zeros(Float64, G, 0)
+        β_pre_chron = Float64[]
+        valid_pre_idx_chron = Int[]
     end
     
-    # Order by τ (ascending)
-    τ_values = Float64[]
-    if length(all_names) > 1 && any(contains.(all_names, "τ::"))
-        
-        for name in all_names
-            if contains(name, "τ::")
-                τ_str = replace(name, "τ::" => "")
-                push!(τ_values, parse(Float64, τ_str))
-            elseif name == "_ATT"
-                push!(τ_values, Inf)
-            else
-                push!(τ_values, 0.0)
-            end
+    # Combine: [pre-trends, tau, controls]
+    if k_ctrl > 0
+        E_combined = hcat(E_pre_chron, E_tau, E_ctrl)
+        all_β = vcat(β_pre_chron, β_tau, β_ctrl)
+    else
+        E_combined = hcat(E_pre_chron, E_tau)
+        all_β = vcat(β_pre_chron, β_tau)
+    end
+    
+    # VCOV = E' * E (matches Stata's matrix accum nocon)
+    Σ_full = transpose(E_combined) * E_combined
+    
+    #=== 13. Assemble names ===#
+    tau_names = if horizons === nothing || horizons === false
+        ["_ATT"]
+    else
+        τvals = Int[]
+        for wname in wtr_syms
+            s = String(wname)
+            τ = parse(Int, replace(s, "__wtr" => ""))
+            push!(τvals, τ)
         end
-        
-        sort_order = sortperm(τ_values)
-        all_β = all_β[sort_order]
-        all_names = all_names[sort_order]
-        Σ_combined = Σ_combined[sort_order, sort_order]
+        ["τ::$(τ)" for τ in sort(τvals)]
     end
     
-    dof = max(n - length(all_β), 1)
-     # Return proper BJSModel
+    # Pre-trend names in chronological order (pre5, pre4, pre3, pre2, pre1)
+    pre_names_final = k_pre > 0 ? ["τ::-$(abs(pre_horizons[i]))" for i in valid_pre_idx_chron] : String[]
+    
+    # Control names
+    ctrl_names_final = k_ctrl > 0 ? String.(valid_ctrl_syms) : String[]
+    
+    all_names = vcat(pre_names_final, tau_names, ctrl_names_final)
+    
+    #=== 14. DOF and return ===#
+    cluster_sym = isnothing(cluster) ? :_no_cluster : cluster
+    n_clusters = isnothing(cluster) ? n : G
+    dof_resid = max(n_clusters - 1, 1)
+    
+    t_periods = if horizons === nothing || horizons === false
+        Int[]
+    else
+        sort(unique(filter(≥(0), filter(!ismissing, K[D .== 1]))))
+    end
+    
     return BJSModel(
-        all_β, Σ_combined, all_names, n, dof;
+        all_β, Σ_full, all_names, n, dof_resid;
         y_name = y,
-        estimator_type = length(all_β) >1 ? :event_study : :static,
-        treatment_periods = length(τ_values) > 0 ? Int.(τ_values) : Int[],
-        first_stage_r2 = r2(m1),
-        n_treated = sum(treat),
-        n_donors = sum(donors),
+        estimator_type = (horizons === nothing || horizons === false) ? :static : :dynamic,
+        treatment_periods = unique(skipmissing(t_periods)),
+        first_stage_r2 = r2_1,
+        n_treated = n_treated,
+        n_donors = n_donors,
         control_type = control_type,
-        boot=false,n_boot=0,cluster=cluster
+        cluster = cluster_sym
     )
 end
 
-
-
 """
-    fit_bjs_static(df; y, id, t, g; kwargs...)
+    fit_bjs_static(df::DataFrame; y, id, t, g, controls=Symbol[], fe=(id,t),
+                   weights=nothing, cluster=nothing, control_type=:notyet,
+                   tol=1e-6, maxiter=1000)
 
-Static ATT alias for `fit_bjs(...; horizons=nothing)`.
-Returns a `SimpleModel` with a single `"_ATT"` coefficient.
-"""
-function fit_bjs_static(df::DataFrame; 
-                        y::Symbol, 
-                        id::Symbol, t::Symbol, g::Symbol,
-                        controls::Vector{Symbol}=Symbol[], 
-                        fe::Tuple{Vararg{Symbol}}=(id,t),
-                        weights::Union{Nothing,Symbol}=nothing,
-                        cluster::Union{Nothing,Symbol}=id,
-                        control_type::Symbol=:notyet)
-    fit_bjs(df; y=y, id=id, t=t, g=g, controls=controls, fe=fe,
-                       weights=weights, cluster=cluster, horizons=nothing,
-                       control_type=control_type)
-end
+Static ATT estimator using Borusyak, Jaravel, and Spiess (2023) imputation.
 
-
-"""
-    fit_bjs_dynamic(df; y, id, t, g; horizons=true, kwargs...)
-
-Dynamic ES alias for `fit_bjs` with `horizons=true` (all τ ≥ 0).
-Returns a `SimpleModel` with coefficients `"τ::<τ>"`.
-"""
-function fit_bjs_dynamic(df::DataFrame; 
-                         y::Symbol, 
-                         id::Symbol, t::Symbol, g::Symbol,
-                         controls::Vector{Symbol}=Symbol[], 
-                         fe::Tuple{Vararg{Symbol}}=(id,t),
-                         weights::Union{Nothing,Symbol}=nothing,
-                         cluster::Union{Nothing,Symbol}=id,
-                         ref::Int=-1,
-                         horizons::Union{Nothing,Bool,Vector{Int}}=true,
-                         pretrends::Union{Nothing,Bool,Vector{Int}}=nothing,
-                         control_type::Symbol=:notyet)
-    fit_bjs(df; y=y, id=id, t=t, g=g, controls=controls, fe=fe,
-                       weights=weights, cluster=cluster, horizons=horizons,
-                       pretrends=pretrends, control_type=control_type)
-end
-
-
-
-
-
-
-
-
-"""
-    fit_bjs_boot(df; y, id, t, g, ...)
-
-Streamlined BJS estimation for bootstrap iterations. Only computes point estimates,
-skipping expensive standard error calculations for speed.
-
-Returns coefficient vector in same order as main `fit_bjs` function.
-"""
-function _fit_bjs_boot(df::DataFrame; 
-                      y::Symbol, 
-                      id::Symbol, t::Symbol, g::Symbol,
-                      controls::Vector{Symbol}=Symbol[],
-                      fe::Tuple{Vararg{Symbol}}=(id, t),
-                      weights::Union{Nothing,Symbol}=nothing,
-                      horizons::Union{Nothing,Bool,Vector{Int}}=nothing,
-                      pretrends::Union{Nothing,Bool,Vector{Int}}=nothing,
-                      control_type::Symbol=:notyet)
-
-    d = copy(df)
-    d[ismissing.(d[!, g]), g] .= 0
-
-    n = nrow(d)
-
-    # Treatment indicator and event time
-    treat = (.!ismissing.(d[!, g])) .& (d[!, g] .> 0) .& (d[!, t] .>= d[!, g])
-    d[!, :__treat] = Int.(treat)
-    make_eventtime!(d; t=t, g=g, new=:ttt, ref_p=-1_000_000)
-
-    # Get event times for pretrend estimation
-    event_times = sort(unique(d[d[!, :ttt] .!= -1_000_000, :ttt]))
-
-    # First stage on donors only
-    donors = donor_mask(d; t=t, g=g, control_type=control_type)
-
-    # Build first stage formula
-    if isempty(controls)
-        fe_terms_sum = reduce(+, [FixedEffectModels.fe(s) for s in fe])
-        f1 = Term(y) ~ fe_terms_sum
-    else
-        control_terms = sum(term.(controls))
-        fe_terms_sum = reduce(+, [FixedEffectModels.fe(s) for s in fe])
-        f1 = Term(y) ~ control_terms + fe_terms_sum
-    end
-    
-    # Fit first stage model
-    m1 = reg(d[donors, :], f1, Vcov.robust(); 
-             weights = weights === nothing ? nothing : weights,save=:fe)
-    
-    # Y(0) prediction
-    y0hat = fe_predict(m1, d)
-    if any(ismissing, y0hat)
-        y0hat = coalesce.(y0hat, 0.0)
-    end
-    y0hat = Float64.(y0hat)
-
-    # Create adjusted outcome
-    d[!, :__adj] = Float64.(d[!, y]) .- y0hat
-    
-    # Treatment effects (main estimation)
-    main_β = Float64[]
-    main_names = String[]
-    treat_mask = d[!, :__treat] .== 1
-    
-    if horizons !== nothing || isnothing(pretrends)
-        # Build treatment weights
-        wtr_syms = build_wtr!(d; ttt=:ttt, treat=:__treat, weights=weights, 
-                              horizons=horizons, prefix="__wtr")
-        k = length(wtr_syms)
-        
-        if k > 0
-            WTR = reduce(hcat, (Float64.(d[!, s]) for s in wtr_syms))
-            
-            if sum(treat_mask) > 0
-                WTR_treated = WTR[treat_mask, :]
-                adj_treated = Float64.(d[treat_mask, :__adj])
-                
-                # Point estimates only
-                main_β = vec(sum(WTR_treated .* adj_treated, dims=1))
-                
-                # Build coefficient names
-                if horizons === nothing
-                    main_names = ["_ATT"]
-                else
-                    τkeep = parse.(Int, replace.(String.(wtr_syms), "__wtr" => ""))
-                    main_names = "τ::" .* string.(τkeep)
-                end
-            end
-        end
-    end
-
-    # Pretrend estimation
-    pre_β = Float64[]
-    pre_names = String[]
-
-    if !isnothing(pretrends) && pretrends !== false
-        pretrend_periods = pretrends === true ? filter(τ -> τ < 0, event_times) : filter(τ -> τ < 0, pretrends)
-
-        if !isempty(pretrend_periods)
-            d_untreated = d[.!treat_mask, :]
-            if nrow(d_untreated) > 0
-                # Build explicit indicator columns
-                pre_syms = Symbol[]
-                for τ in pretrend_periods
-                    s = Symbol("__pre_", τ)
-                    push!(pre_syms, s)
-                    d_untreated[!, s] = Float64.(d_untreated[!, :ttt] .== τ)
-                end
-
-                # Build formula
-                control_terms = isempty(controls) ? nothing : sum(term.(controls))
-                fe_terms_sum = length(fe) == 0 ? nothing : reduce(+, [FixedEffectModels.fe(s) for s in fe])
-                pre_terms_sum = sum(term.(pre_syms))
-
-                rhs_list = Any[pre_terms_sum]
-                if control_terms !== nothing; push!(rhs_list, control_terms); end
-                if fe_terms_sum !== nothing; push!(rhs_list, fe_terms_sum); end
-                rhs_pre = reduce(+, rhs_list)
-
-                f_pre = Term(y) ~ rhs_pre
-                
-                # Fit pretrend model 
-                pre_est = reg(d_untreated, f_pre, Vcov.robust(); weights=weights)
-
-                # Extract coefficients
-                cn = StatsAPI.coefnames(pre_est)
-                coefs = StatsAPI.coef(pre_est)
-
-                # Map symbols to indices
-                idx_map = Dict{Symbol, Int}()
-                for (i, nm) in pairs(cn)
-                    try
-                        idx_map[Symbol(nm)] = i
-                    catch
-                    end
-                end
-
-                pre_indices = [get(idx_map, Symbol("__pre_", τ), nothing) for τ in pretrend_periods]
-                keep_mask = map(!isnothing, pre_indices)
-                pre_indices = collect(skipmissing(pre_indices))
-
-                if !isempty(pre_indices)
-                    pre_β = coefs[pre_indices]
-                    pre_names = ["τ::$(τ)" for (τ, keep) in zip(pretrend_periods, keep_mask) if keep]
-                end
-            end
-        end
-    end
-
-    # Combine and order coefficients (same logic as main function)
-    all_β = vcat(pre_β, main_β)
-    all_names = vcat(pre_names, main_names)
-    
-    # Order by τ (same as main function)
-    if length(all_names) > 1 && any(contains.(all_names, "τ::"))
-        τ_values = Float64[]
-        for name in all_names
-            if contains(name, "τ::")
-                τ_str = replace(name, "τ::" => "")
-                push!(τ_values, parse(Float64, τ_str))
-            elseif name == "_ATT"
-                push!(τ_values, Inf)
-            else
-                push!(τ_values, 0.0)
-            end
-        end
-        
-        sort_order = sortperm(τ_values)
-        all_β = all_β[sort_order]
-        all_names = all_names[sort_order]
-    end
-    
-    # Return just the coefficient vector (not full model)
-    return all_β
-end
-
-
-
-
-
-
-
-
-"""
-    fit_bjs_wild_bootstrap(df; y, id, t, g,
-                       controls = Symbol[],
-                       fe::Tuple = (id, t),
-                       weights::Union{Nothing,Symbol} = nothing,
-                       cluster::Union{Nothing,Symbol} = nothing,
-                       horizons::Union{Nothing,Bool,Vector{Int}} = nothing,
-                       pretrends::Union{Nothing,Bool,Vector{Int}} = nothing,
-                       control_type::Symbol = :notyet,
-                       n_bootstrap::Int = 500,
-                       rng::Union{Nothing,AbstractRNG} = nothing)
-
-Wild bootstrap for BJS imputation estimator to obtain joint covariance matrix 
-across pre-treatment and post-treatment estimates.
-
-This function addresses the fundamental limitation of the BJS method: since pretrends
-and treatment effects come from separate regressions, we cannot analytically compute
-their joint covariance. Wild bootstrap solves this by:
-
-1. **Bootstrap the entire BJS procedure** including both stages
-2. **Respect cluster structure** when applying bootstrap weights
-3. **Extract joint distribution** of all coefficients
-4. **Compute empirical covariance** matrix
-
-## Wild Bootstrap Procedure
-
-For each bootstrap iteration:
-1. **First stage residuals**: Get residuals from donor regression y ~ controls + FE
-2. **Apply cluster-level wild weights**: Multiply residuals by εᵇ ~ Rademacher(±1)
-3. **Bootstrap outcomes**: y*ᵇ = XβÌ, + ε*ᵇ (where ε*ᵇ respects cluster structure)
-4. **Re-estimate BJS**: Run full BJS procedure on bootstrap data
-5. **Extract all coefficients**: Both treatment effects and pretrends
-
-# Arguments
-Same as `fit_bjs` plus:
-- `n_bootstrap::Int`: Number of bootstrap iterations (default: 500)
-- `rng::Union{Nothing,AbstractRNG}`: Random number generator for reproducibility
+Wrapper for `fit_bjs(...; horizons=nothing, pretrends=nothing)`.
+See `fit_bjs` for full documentation.
 
 # Returns
-`SimpleModel` with bootstrap covariance matrix, fully compatible with StatsAPI.
-This means you can use all existing functions like `cumulative_effects()`, 
-`joint_pretrend_test()`, etc. directly on the bootstrap result.
-
-Note: If you need the raw bootstrap draws for further analysis, you can access
-them by running the bootstrap manually or modify the function to also return them.
-
-# Examples
-```julia
-# Basic wild bootstrap
-boot_model = fit_bjs_wild_bootstrap(df; y=:ret, id=:fund, t=:month, g=:g,
-                                horizons=true, pretrends=true,
-                                cluster=:fund, n_bootstrap=500)
-
-# Now use ANY existing function with bootstrap covariance!
-cum_effects = cumulative_effects(boot_model; ref_period=-1)
-pretrend_test = joint_pretrend_test(boot_model; leads=[-3,-2,-1])
-
-# Standard StatsAPI functions work too
-coef(boot_model)        # Point estimates
-vcov(boot_model)        # Bootstrap covariance matrix
-coefnames(boot_model)   # Coefficient names
-```
+`BJSModel` with single `"_ATT"` coefficient.
 """
-function fit_bjs_wild_bootstrap(df::DataFrame; 
-                            y::Symbol, 
-                            id::Symbol, t::Symbol, g::Symbol,
-                            controls::Vector{Symbol}=Symbol[],
-                            fe::Tuple{Vararg{Symbol}}=(id, t),
-                            weights::Union{Nothing,Symbol}=nothing,
-                            cluster::Union{Nothing,Symbol}=id,
-                            horizons::Union{Nothing,Bool,Vector{Int}}=nothing,
-                            pretrends::Union{Nothing,Bool,Vector{Int}}=nothing,
-                            control_type::Symbol=:notyet,
-                            n_bootstrap::Int=500,
-                            seed::Union{Nothing,Int}=nothing)
-
-    rng = Random.default_rng()
-    if isnothing(seed)
-        nothing
-    else
-        Random.seed!(rng,seed)
-    end
+function fit_bjs_static(df::DataFrame;
+    y::Symbol,
+    id::Symbol,
+    t::Symbol,
+    g::Symbol,
+    controls::Vector{Symbol} = Symbol[],
+    fe::Tuple = (id, t),
+    weights::Union{Nothing,Symbol} = nothing,
+    cluster::Union{Nothing,Symbol} = nothing,
+    control_type::Symbol = :notyet,
+    tol::Float64 = 1e-6,
+    maxiter::Int = 1000)
     
-    # Get original estimates
-    original_model = fit_bjs(df; y=y, id=id, t=t, g=g,
-                                        controls=controls, fe=fe,
-                                        weights=weights, cluster=cluster,
-                                        horizons=horizons, pretrends=pretrends,
-                                        control_type=control_type)
-    
-    original_coefs = StatsAPI.coef(original_model)
-    original_names = StatsAPI.coefnames(original_model)
-    n_coefs = length(original_coefs)
-    
-    # Prepare data (same preprocessing as original)
-    d = copy(df)
-    d[ismissing.(d[!, g]), g] .= 0
-    
-    # Missing data handling
-    key_vars = [y, id, t, g]
-    if !isnothing(weights); push!(key_vars, weights); end
-    if !isnothing(cluster); push!(key_vars, cluster); end
-    append!(key_vars, controls)
-    append!(key_vars, collect(fe))
-    key_vars = unique(key_vars)
-    
-    missing_mask = falses(nrow(d))
-    for var in key_vars
-        missing_mask .|= ismissing.(d[!, var])
-    end
-    if any(missing_mask)
-        d = d[.!missing_mask, :]
-    end
-    
-    # Create treatment variables
-    treat = (.!ismissing.(d[!, g])) .& (d[!, g] .> 0) .& (d[!, t] .>= d[!, g])
-    d[!, :__treat] = Int.(treat)
-    make_eventtime!(d; t=t, g=g, new=:ttt, ref_p=-1_000_000)
-    
-    # Get donors and fit first stage (for bootstrap residuals)
-    donors = donor_mask(d; t=t, g=g, control_type=control_type)
-    
-    # Build first stage formula
-    if isempty(controls)
-        fe_terms_sum = reduce(+, [FixedEffectModels.fe(s) for s in fe])
-        f1 = Term(y) ~ fe_terms_sum
-    else
-        control_terms = sum(term.(controls))
-        fe_terms_sum = reduce(+, [FixedEffectModels.fe(s) for s in fe])
-        f1 = Term(y) ~ control_terms + fe_terms_sum
-    end
-    
-    w_vec = isnothing(weights) ? nothing : Float64.(d[!, weights])
-    
-    # Fit original first stage to get residuals
-    m1_original = reg(d[donors, :], f1, Vcov.robust(); 
-                     weights = w_vec === nothing ? nothing : w_vec[donors],
-                     save = :fe)
-    
-    # Get fitted values and residuals using fe_predict
-    y_fitted_donors_full = fe_predict(m1_original, d)
-    y_fitted_donors = y_fitted_donors_full[donors]
-    residuals_donors = Float64.(d[donors, y]) .- y_fitted_donors
-    
-    # Set up cluster structure for wild bootstrap
-    cl_var = isnothing(cluster) ? id : cluster
-    cluster_ids = unique(d[donors, cl_var])
-    n_clusters = length(cluster_ids)
-    
-    # Create mapping from observations to clusters (donor sample only)
-    donor_cluster_map = Dict{eltype(cluster_ids), Vector{Int}}()
-    for (i, obs_idx) in enumerate(findall(donors))
-        cl_id = d[obs_idx, cl_var]
-        if !haskey(donor_cluster_map, cl_id)
-            donor_cluster_map[cl_id] = Int[]
-        end
-        push!(donor_cluster_map[cl_id], i)
-    end
-    
-    # Storage for bootstrap results
-    bootstrap_coefs = Matrix{Float64}(undef, n_bootstrap, n_coefs)
-    
-    for b in 1:n_bootstrap
-        try
-            # Generate cluster-level wild bootstrap weights (Rademacher)
-            cluster_weights = Dict{eltype(cluster_ids), Float64}()
-            for cl_id in cluster_ids
-                cluster_weights[cl_id] = rand(rng, [-1.0, 1.0])
-            end
-            
-            # Apply wild weights to residuals (cluster-level)
-            residuals_bootstrap = copy(residuals_donors)
-            for (cl_id, obs_indices) in donor_cluster_map
-                weight = cluster_weights[cl_id]
-                residuals_bootstrap[obs_indices] .*= weight
-            end
-            
-            # Create bootstrap outcomes on donor sample
-            y_bootstrap_donors = y_fitted_donors .+ residuals_bootstrap
-            
-            # Create bootstrap dataset
-            d_bootstrap = copy(d)
-            d_bootstrap[donors, y] = y_bootstrap_donors
-            
-            # Run full BJS estimation on bootstrap data
-            boot_coefs = _fit_bjs_boot(d_bootstrap; 
-                                                y=y, id=id, t=t, g=g,
-                                                controls=controls, fe=fe,
-                                                weights=weights,
-                                                horizons=horizons, pretrends=pretrends,
-                                                control_type=control_type)
-            
-            # Store bootstrap coefficients
-            bootstrap_coefs[b, :] = boot_coefs
-            
-        catch e
-            # Fill with NaN for failed iterations
-            bootstrap_coefs[b, :] .= NaN
-        end
-    end
-    
-    # Remove failed iterations
-    valid_iterations = .!any(isnan.(bootstrap_coefs), dims=2)[:, 1]
-    bootstrap_coefs_clean = bootstrap_coefs[valid_iterations, :]
-    n_valid = sum(valid_iterations)
-    
-    if n_valid < 50
-        error("Too few successful bootstrap iterations ($n_valid). Check your model specification.")
-    end
-    
-    # Compute bootstrap covariance matrix
-    vcov_bootstrap = cov(bootstrap_coefs_clean)
-    
-    # Extract model information from original BJSModel
-    n_obs = StatsAPI.nobs(original_model)
-    dof_resid = StatsAPI.dof_residual(original_model)
-    
-    # Create BJSModel with bootstrap covariance
-    bootstrap_model = BJSModel(
-        original_coefs, vcov_bootstrap, original_names, n_obs, dof_resid;
-        y_name = original_model.y_name,
-        estimator_type = original_model.estimator_type,
-        treatment_periods = original_model.treatment_periods,
-        first_stage_r2 = original_model.first_stage_r2,
-        n_treated = original_model.n_treated,
-        n_donors = original_model.n_donors,
-        control_type = original_model.control_type,
-        boot=true,n_boot=n_bootstrap,cluster=cluster
-    )
-    
-    return bootstrap_model
+    return fit_bjs(df; y=y, id=id, t=t, g=g,
+                   controls=controls, fe=fe, weights=weights,
+                   cluster=cluster, horizons=nothing, pretrends=nothing,
+                   control_type=control_type, tol=tol, maxiter=maxiter)
 end
 
 
+"""
+    fit_bjs_dynamic(df::DataFrame; y, id, t, g, controls=Symbol[], fe=(id,t),
+                    weights=nothing, cluster=nothing, horizons=true,
+                    pretrends=true, avgeffectsby=nothing,
+                    control_type=:notyet, tol=1e-6, maxiter=1000)
 
+Dynamic event-study estimator using Borusyak, Jaravel, and Spiess (2023) imputation.
 
-function fit_bjs_wild_bootstrap_mthreaded(df::DataFrame; 
-                            y::Symbol, 
-                            id::Symbol, t::Symbol, g::Symbol,
-                            controls::Vector{Symbol}=Symbol[],
-                            fe::Tuple{Vararg{Symbol}}=(id, t),
-                            weights::Union{Nothing,Symbol}=nothing,
-                            cluster::Union{Nothing,Symbol}=nothing,
-                            horizons::Union{Nothing,Bool,Vector{Int}}=nothing,
-                            pretrends::Union{Nothing,Bool,Vector{Int}}=nothing,
-                            control_type::Symbol=:notyet,
-                            n_bootstrap::Int=500,
-                            seed::Union{Nothing,Int}=nothing)
+Wrapper for `fit_bjs` with `horizons=true` and `pretrends=true` by default.
+See `fit_bjs` for full documentation.
 
-    # Get original estimates
-    original_model = fit_bjs(df; y=y, id=id, t=t, g=g,
-                                        controls=controls, fe=fe,
-                                        weights=weights, cluster=cluster,
-                                        horizons=horizons, pretrends=pretrends,
-                                        control_type=control_type)
+# Returns
+`BJSModel` with `"τ::0"`, `"τ::1"`, etc. coefficients and pre-trends).
+"""
+function fit_bjs_dynamic(df::DataFrame;
+    y::Symbol,
+    id::Symbol,
+    t::Symbol,
+    g::Symbol,
+    controls::Vector{Symbol} = Symbol[],
+    fe::Tuple = (id, t),
+    weights::Union{Nothing,Symbol} = nothing,
+    cluster::Union{Nothing,Symbol} = nothing,
+    horizons::Union{Bool,Vector{Int}} = true,
+    pretrends::Union{Nothing,Bool,Int,Vector{Int}} = true,
+    avgeffectsby::Union{Nothing,Vector{Symbol}} = nothing,
+    control_type::Symbol = :notyet,
+    tol::Float64 = 1e-6,
+    maxiter::Int = 1000)
     
-    original_coefs = StatsAPI.coef(original_model)
-    original_names = StatsAPI.coefnames(original_model)
-    n_coefs = length(original_coefs)
-    
-    # Prepare data (same preprocessing as original)
-    d = copy(df)
-    d[ismissing.(d[!, g]), g] .= 0
-    
-    # Missing data handling
-    key_vars = [y, id, t, g]
-    if !isnothing(weights); push!(key_vars, weights); end
-    if !isnothing(cluster); push!(key_vars, cluster); end
-    append!(key_vars, controls)
-    append!(key_vars, collect(fe))
-    key_vars = unique(key_vars)
-    
-    missing_mask = falses(nrow(d))
-    for var in key_vars
-        missing_mask .|= ismissing.(d[!, var])
-    end
-    if any(missing_mask)
-        d = d[.!missing_mask, :]
-    end
-    
-    # Create treatment variables
-    treat = (.!ismissing.(d[!, g])) .& (d[!, g] .> 0) .& (d[!, t] .>= d[!, g])
-    d[!, :__treat] = Int.(treat)
-    make_eventtime!(d; t=t, g=g, new=:ttt, ref_p=-1_000_000)
-    
-    # Get donors and fit first stage (for bootstrap residuals)
-    donors = donor_mask(d; t=t, g=g, control_type=control_type)
-    
-    # Build first stage formula
-    if isempty(controls)
-        fe_terms_sum = reduce(+, [FixedEffectModels.fe(s) for s in fe])
-        f1 = Term(y) ~ fe_terms_sum
-    else
-        control_terms = sum(term.(controls))
-        fe_terms_sum = reduce(+, [FixedEffectModels.fe(s) for s in fe])
-        f1 = Term(y) ~ control_terms + fe_terms_sum
-    end
-    
-    w_vec = isnothing(weights) ? nothing : Float64.(d[!, weights])
-    
-    # Fit original first stage to get residuals
-    m1_original = reg(d[donors, :], f1, Vcov.robust(); 
-                     weights = w_vec === nothing ? nothing : w_vec[donors],
-                     save = :fe)
-    
-    # Get fitted values and residuals using fe_predict
-    y_fitted_donors_full = fe_predict(m1_original, d)
-    y_fitted_donors = y_fitted_donors_full[donors]
-    residuals_donors = Float64.(d[donors, y]) .- y_fitted_donors
-    
-    # Set up cluster structure for wild bootstrap
-    cl_var = isnothing(cluster) ? id : cluster
-    cluster_ids = unique(d[donors, cl_var])
-    n_clusters = length(cluster_ids)
-    
-    # Create mapping from observations to clusters (donor sample only)
-    donor_cluster_map = Dict{eltype(cluster_ids), Vector{Int}}()
-    for (i, obs_idx) in enumerate(findall(donors))
-        cl_id = d[obs_idx, cl_var]
-        if !haskey(donor_cluster_map, cl_id)
-            donor_cluster_map[cl_id] = Int[]
-        end
-        push!(donor_cluster_map[cl_id], i)
-    end
-    
-    # Storage for bootstrap results
-    bootstrap_coefs = Matrix{Float64}(undef, n_bootstrap, n_coefs)
-    
-    # Create one RNG per thread (typically 4-16 RNGs instead of 500)
-    base_seed = isnothing(seed) ? 12345 : seed
-    thread_rngs = [Random.MersenneTwister() for _ in 1:Threads.nthreads()]
-    
-    Threads.@threads for b in 1:n_bootstrap
-        thread_id = Threads.threadid()
-        local_rng = thread_rngs[thread_id]
-        
-        # Seed deterministically based on iteration (small overhead, but much less than RNG creation)
-        Random.seed!(local_rng, xor(base_seed, 0x9E3779B97F4A7C15 * UInt(b)))
-        
-        try
-            # Generate cluster-level wild bootstrap weights (Rademacher)
-            cluster_weights = Dict{eltype(cluster_ids), Float64}()
-            for cl_id in cluster_ids
-                cluster_weights[cl_id] = rand(local_rng, [-1.0, 1.0])
-            end
-            # Apply wild weights to residuals (cluster-level)
-            residuals_bootstrap = copy(residuals_donors)
-            for (cl_id, obs_indices) in donor_cluster_map
-                weight = cluster_weights[cl_id]
-                residuals_bootstrap[obs_indices] .*= weight
-            end
-            
-            # Create bootstrap outcomes on donor sample
-            y_bootstrap_donors = y_fitted_donors .+ residuals_bootstrap
-            
-            # Create bootstrap dataset
-            d_bootstrap = copy(d)
-            d_bootstrap[donors, y] = y_bootstrap_donors
-            
-            # Run streamlined BJS estimation on bootstrap data (MUCH FASTER)
-            boot_coefs = _fit_bjs_boot(d_bootstrap; 
-                                     y=y, id=id, t=t, g=g,
-                                     controls=controls, fe=fe,
-                                     weights=weights,
-                                     horizons=horizons, pretrends=pretrends,
-                                     control_type=control_type)
-            
-            # Store bootstrap coefficients
-            bootstrap_coefs[b, :] = boot_coefs
-            
-        catch e
-            # Fill with NaN for failed iterations
-            bootstrap_coefs[b, :] .= NaN
-        end
-    end
-    
-    # Remove failed iterations
-    valid_iterations = .!any(isnan.(bootstrap_coefs), dims=2)[:, 1]
-    bootstrap_coefs_clean = bootstrap_coefs[valid_iterations, :]
-    n_valid = sum(valid_iterations)
-    
-    if n_valid < 50
-        error("Too few successful bootstrap iterations ($n_valid). Check your model specification.")
-    end
-    
-    # Compute bootstrap covariance matrix
-    vcov_bootstrap = cov(bootstrap_coefs_clean)
-    
-    # Extract model information from original BJSModel
-    n_obs = StatsAPI.nobs(original_model)
-    dof_resid = StatsAPI.dof_residual(original_model)
-    
-    # Create BJSModel with bootstrap covariance
-    bootstrap_model = BJSModel(
-        original_coefs, vcov_bootstrap, original_names, n_obs, dof_resid;
-        y_name = original_model.y_name,
-        estimator_type = original_model.estimator_type,
-        treatment_periods = original_model.treatment_periods,
-        first_stage_r2 = original_model.first_stage_r2,
-        n_treated = original_model.n_treated,
-        n_donors = original_model.n_donors,
-        control_type = original_model.control_type,
-        boot=true,n_boot=n_bootstrap,cluster=cluster
-    )
-    
-    return bootstrap_model
+    return fit_bjs(df; y=y, id=id, t=t, g=g,
+                   controls=controls, fe=fe, weights=weights,
+                   cluster=cluster, horizons=horizons, pretrends=pretrends,
+                   avgeffectsby=avgeffectsby, control_type=control_type,
+                   tol=tol, maxiter=maxiter)
 end

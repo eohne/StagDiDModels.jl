@@ -120,7 +120,7 @@ y_it ~ post_it + controls + FE(id) + FE(t),  post_it = 1{t ≥ g, g>0}
 
 # Returns
 
-* `StatisticalModel` with a single `"post"` coefficient and clustered vcov.
+* `StatisticalModel` with a single `"_ATT"` coefficient and clustered vcov.
 
 # Example
 
@@ -135,14 +135,14 @@ function fit_twfe_static(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Sym
     control_type::Symbol=:notyet)
 
     d = copy(df)
-    make_post!(d; t=t, g=g, new=:post)  # 1{t >= g, g>0}, with g==0/missing as never-treated
+    make_post!(d; t=t, g=g, new=:_ATT)  # 1{t >= g, g>0}, with g==0/missing as never-treated
     
     # Build formula
     if isempty(controls)
-        rhs = term(:post) + FixedEffectModels.fe(id) + FixedEffectModels.fe(t)
+        rhs = term(:_ATT) + FixedEffectModels.fe(id) + FixedEffectModels.fe(t)
     else
         control_terms = sum(term.(controls))
-        rhs = control_terms + term(:post) + FixedEffectModels.fe(id) + FixedEffectModels.fe(t)
+        rhs = control_terms + term(:_ATT) + FixedEffectModels.fe(id) + FixedEffectModels.fe(t)
     end
     
     f = Term(y) ~ rhs
@@ -152,5 +152,5 @@ function fit_twfe_static(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Sym
     m=reg(d, f, vc; weights=wv)
         TWFEModel(coef(m), vcov(m), coefnames(m), nobs(m), dof_residual(m), y, :static,
                         Int[],r2(m), adjr2(m), 
-                        sum(d[:,:post].>0), sum(d[:,:post].==0),isnothing(cluster) ? :none : cluster)
+                        sum(d[:,:_ATT].>0), sum(d[:,:_ATT].==0),isnothing(cluster) ? :none : cluster)
 end

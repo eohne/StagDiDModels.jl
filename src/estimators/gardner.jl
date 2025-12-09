@@ -214,7 +214,7 @@ end
 """
     fit_gardner_dynamic(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
                       controls::Vector{Symbol}=Symbol[], cluster::Symbol,
-                      ref_p::Int=-1_000_000, weights::Union{Nothing,Symbol}=nothing,
+                      ref_p::Int=-1, weights::Union{Nothing,Symbol}=nothing,
                       control_type::Symbol=:notyet)
 
 Gardner (2021) two-stage difference-in-differences estimator for event study analysis.
@@ -253,7 +253,7 @@ coefnames(model)  # Event time coefficients: "τ::-2", "τ::0", etc.
 """
 function fit_gardner_dynamic(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
                            controls::Vector{Symbol}=Symbol[], cluster::Symbol=id,
-                           ref_p::Int=-1_000_000,
+                           ref_p::Int=-1,
                            weights::Union{Nothing,Symbol}=nothing,
                            control_type::Symbol=:notyet)
 
@@ -267,7 +267,7 @@ function fit_gardner_dynamic(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g:
     d[!, :_ATT] = Int.(treat)
     
     # Create event time 
-    make_eventtime!(d; t=t, g=g, new=:ttt, ref_p=-1_000_000)
+    make_eventtime!(d; t=t, g=g, new=:ttt, ref_p=ref_p)
     
     # Count observations for diagnostics
     n_treated = sum(d[!, :_ATT])

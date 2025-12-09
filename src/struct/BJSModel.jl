@@ -19,8 +19,6 @@ struct BJSModel <: RegressionModel
     n_treated::Int                  # number of treated observations
     n_donors::Int                   # number of donor observations
     control_type::Symbol            # :notyet or :never
-    boot::Bool                      # true or false
-    n_boot::Int                    # Bootstrap Iterations
     cluster::Symbol                 # Cluster var
 end
 
@@ -99,11 +97,6 @@ function top(m::BJSModel)
             "Donor obs" sprint(show, m.n_donors, context = :compact => true);
             "R² First Stage" @sprintf("%.3f",m.first_stage_r2);
             ]
-    if m.boot
-        out= vcat(out,[
-            "Bootstrapped" sprint(show,m.boot,context = :compact => true);
-            "N Boot" sprint(show, m.n_boot,context = :compact => true)]) 
-    end
     out= vcat(out,[
         "Cluster" sprint(show, m.cluster,context = :compact => true)]) 
 
@@ -184,10 +177,8 @@ function BJSModel(β::AbstractVector, Σ::AbstractMatrix, names::AbstractVector,
                   n_treated::Int = 0,
                   n_donors::Int = 0, 
                   control_type::Symbol = :notyet,
-                  boot::Bool = false,
-                  n_boot::Int = 0,
                   cluster::Symbol = :none)
     
     return BJSModel(β, Σ, names, nobs, dof_resid, y_name, estimator_type,
-                    treatment_periods, first_stage_r2, n_treated, n_donors, control_type,boot,n_boot,cluster)
+                    treatment_periods, first_stage_r2, n_treated, n_donors, control_type,cluster)
 end
