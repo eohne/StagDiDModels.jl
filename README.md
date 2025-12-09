@@ -430,7 +430,7 @@ using Makie, CairoMakie
 m = fit_bjs_dynamic(df; y=:dep_var, id=:unit, t=:year, g=:g,cluster=:unit);
    fig = plot_event_study(m; title="BJS Event Study", color=:steelblue)
 ```
-![Event Study](dcos\assets\images\event_study.png)
+![Event Study](docs/assets/images/event_study.svg)
 
 ### Event Study with Multiple Estimators
 ```julia
@@ -439,7 +439,7 @@ result = plot_comparison(df;
        models=[:bjs, :gardner, :sunab, :twfe],
        cluster=:unit).figure
 ```
-![Comparison](dcos\assets\images\comp_plot.png)
+![Comparison](docs/assets/images/comp_plot.svg)
 
 ## Common Parameters
 
