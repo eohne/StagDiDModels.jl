@@ -401,20 +401,7 @@ julia> cum_effects.τ           # Event times
 40-element Vector{Int64}:
  -20
  -19
- -18
- -17
- -16
- -15
- -14
- -13
- -12
    ⋮
-  13
-  14
-  15
-  16
-  17
-  18
   19
   20
 
@@ -422,20 +409,7 @@ julia> cum_effects.cumulative  # Cumulative effects
 40-element Vector{Float64}:
  -0.7009304415811053
  -0.6857427528313305
- -0.677471657514477
- -0.577710396409898
- -0.5016212094751029
- -0.3880683662564499
- -0.2667826251748895
- -0.26775119220209187
- -0.1802202738486773
   ⋮
- 31.008157029736946
- 33.93738420610996
- 36.79960674927678
- 39.8277756899815
- 42.96912935801961
- 45.7628134320334
  48.78563490491884
  51.83780653599853
 
@@ -443,23 +417,29 @@ julia> cum_effects.std_errors  # Standard errors
 40-element Vector{Float64}:
  1.6669189569635976
  1.5663756814986112
- 1.4673219542503684
- 1.3602669615379146
- 1.2599103762644024
- 1.1534641429079246
- 1.0517557824629216
- 0.9582753917312682
- 0.8641250160431497
  ⋮
- 1.1318377867138403
- 1.228027968063689
- 1.328058856000069
- 1.4259733540839399
- 1.5240536638520439
- 1.6277411484899331
  1.728900903879408
  1.8318442896860898
 ```
+
+## Plotting
+
+### Simple Event Study Plot
+```julia
+using Makie, CairoMakie
+m = fit_bjs_dynamic(df; y=:dep_var, id=:unit, t=:year, g=:g,cluster=:unit);
+   fig = plot_event_study(m; title="BJS Event Study", color=:steelblue)
+```
+![Event Study](dcos\assets\images\event_study.png)
+
+### Event Study with Multiple Estimators
+```julia
+result = plot_comparison(df; 
+       y=:dep_var, id=:unit, t=:year, g=:g,
+       models=[:bjs, :gardner, :sunab, :twfe],
+       cluster=:unit).figure
+```
+![Comparison](dcos\assets\images\comp_plot.png)
 
 ## Common Parameters
 

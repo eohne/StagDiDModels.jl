@@ -863,7 +863,7 @@ function fit_bjs(df::DataFrame;
     
     #=== 0. Copy and clean data ===#
     d = copy(df)
-    
+    d[!, g] = replace(d[!, g], 0 => missing)
     key_vars = Symbol[y, id, t]
     append!(key_vars, controls)
     if !isnothing(weights); push!(key_vars, weights); end
