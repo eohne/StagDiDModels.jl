@@ -4,7 +4,7 @@ using Logging # Turns of the printing of FixedEffectModels.jl
 using DataFrames
 using StatsAPI
 using StatsModels
-using StatsModels: cols
+# using StatsModels: cols
 using FixedEffectModels
 using CovarianceMatrices
 using CategoricalArrays
@@ -32,7 +32,7 @@ export responsename, coef, vcov, coefnames, nobs, dof_resiudual, dof, stderror, 
 include("utils/preprocess.jl")
 include("utils/build_vcov.jl")
 include("utils/fe_predict.jl")
-
+include("utils/autosample_utils.jl")
 
 # estimators
 include("estimators/twfe.jl")

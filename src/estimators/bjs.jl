@@ -791,29 +791,26 @@ end
         avgeffectsby::Union{Nothing,Vector{Symbol}} = nothing,
         control_type::Symbol = :notyet,
         tol::Float64 = 1e-6,
-        maxiter::Int = 1000)
+        maxiter::Int = 1000,
+        autosample::Bool = true)
 
 Estimate treatment effects using the Borusyak, Jaravel, and Spiess (2023) 
 imputation estimator for staggered adoption designs. This implementation 
 follows the logic of the official Stata `did_imputation` command, including 
 its analytic influence-function variance estimation.
 
-Supports static ATT estimation, dynamic event-study effects, 
-pre-trend coefficients, and control variables with proper joint VCOV.
-
 # Arguments
 - `df::DataFrame`: Long panel dataset in (i,t) format.
 - `y::Symbol`: Outcome variable.
 - `id::Symbol`: Unit (e.g. firm, fund) identifier.
 - `t::Symbol`: Time period identifier (integer-coded).
-- `g::Symbol`: First treatment period for each unit. Missing values indicate never-treated units.
+- `g::Symbol`: First treatment period for each unit. Missing/0 values indicate never-treated units.
 
 # Keyword Arguments
-
-- `controls::Vector{Symbol}`: Time-varying covariates included in the imputation regression. Control coefficients are included in the output with proper SEs.
+- `controls::Vector{Symbol}`: Time-varying covariates included in the imputation regression.
 - `fe::Tuple = (id, t)`: Absorbed fixed effects. Default is unit + time FE.
 - `weights::Union{Nothing,Symbol}`: Optional observation weights.
-- `cluster::Union{Nothing,Symbol}`: Clustering variable for standard errors. If `nothing`, heteroskedastic-robust SEs are used.
+- `cluster::Union{Nothing,Symbol}`: Clustering variable for standard errors.
 - `horizons::Union{Nothing,Bool,Vector{Int}}`: Controls dynamic vs. static estimation:
     - `nothing` → static ATT (single coefficient)
     - `true` → estimate all post-treatment horizons (τ ≥ 0)  
@@ -823,22 +820,20 @@ pre-trend coefficients, and control variables with proper joint VCOV.
     - `true` → all negative horizons (τ < 0)
     - `Int` → number of pre-periods (e.g., `5` means K=-1 to K=-5)
     - `Vector{Int}` → specific pre-horizons
-- `avgeffectsby::Union{Nothing,Vector{Symbol}}`: Grouping variables for averaging treatment effects in the variance calculation. Default is `[g, t]` (cohort x time), matching Stata's default behavior.
-- `control_type::Symbol = :notyet`: Donor pool definition (not yet implemented, currently always uses not-yet-treated + never-treated).
+- `avgeffectsby`: Grouping variables for averaging treatment effects. Default is `[g, t]` (cohort x time), matching Stata's default behavior.
+- `control_type::Symbol = :notyet`: Donor pool definition.
 - `tol::Float64 = 1e-6`: Convergence tolerance for influence weight iteration.
 - `maxiter::Int = 1000`: Maximum iterations for influence weight computation.
+- `autosample::Bool = true`: If true (default), drop treated observations where FE cannot 
+                             be imputed from donor sample. If false, error.
 
-# Output
-
-Returns a `BJSModel` object.
-
-Supports the `StatsAPI` interface: `coef`, `vcov`, `stderror`, `coefnames`, 
-`confint`, `pvalue`, `nobs`, `dof_residual`, `r2` (only the first stage r2 is available).
+# Returns
+`BJSModel` object.
 
 # Notes
-
-- Never-treated units: code as `missing` in `g`
+- Never-treated units: code as `missing` or `0` in `g`
 - Time variable must be integer-coded
+- When `autosample=true`, observations where FE cannot be imputed are dropped with a warning.
 """
 function fit_bjs(df::DataFrame;
     y::Symbol,
@@ -854,7 +849,8 @@ function fit_bjs(df::DataFrame;
     avgeffectsby::Union{Nothing,Vector{Symbol}} = nothing,
     control_type::Symbol = :notyet,
     tol::Float64 = 1e-6,
-    maxiter::Int = 1000
+    maxiter::Int = 1000,
+    autosample::Bool = true
     )
     # Default avgeffectsby to (cohort, time)
     if avgeffectsby === nothing
@@ -887,7 +883,7 @@ function fit_bjs(df::DataFrame;
     K = Vector{Union{Int,Missing}}(undef, n)
     for i in 1:n
         gi = d[i, g]
-        K[i] = ismissing(gi) ? missing : d[i, t] - gi
+        K[i] = (ismissing(gi) || gi == 0) ? missing : d[i, t] - gi
     end
     d[!, :K] = K
     
@@ -911,20 +907,47 @@ function fit_bjs(df::DataFrame;
          Term(y) ~ fe_terms : 
          Term(y) ~ sum(term.(controls)) + fe_terms
     
-    m1 = quiet_reg(d[donors, :], f1; weights=weights, save=:all,progress_bar=false)  # save=:all to get residuals
+    m1 = quiet_reg(d[donors, :], f1; weights=weights, save=:all, progress_bar=false)
     r2_1 = FixedEffectModels.r2(m1)
     
+    #=== AUTOSAMPLE: Check which treated observations can be imputed ===#
+    treated_mask = BitVector(D .== 1)
+    keep_mask, n_dropped = apply_autosample(d, m1, treated_mask; 
+                                             autosample=autosample, verbose=true)
+    
+    if n_dropped > 0
+        # Filter the dataset
+        d = d[keep_mask, :]
+        n = nrow(d)
+        
+        # Update all relevant variables
+        wei = isnothing(weights) ? ones(Float64, n) : Float64.(d[!, weights])
+        D = d[!, :D]
+        K = d[!, :K]
+        donors = D .== 0
+        n_donors = count(donors)
+        n_treated = n - n_donors
+        treated_mask = BitVector(D .== 1)
+    end
+    
     # Save first-stage imputation residual (needed for control SEs)
-    # This is Y - Y0 among donors, will be 0 for treated
+    # Note: m1 was fit on original donor sample, but we may have filtered d
+    # The autosample only drops TREATED observations, so donors are unchanged
+    # Therefore we can safely map residuals from m1 to the current d
+    
     imput_resid_raw = residuals(m1)
     esample_m1 = m1.esample
-    imput_resid = zeros(Float64, nrow(d))
+    imput_resid = zeros(Float64, n)
+    
+    # Map residuals: donors in current d should match donors in original fit
     donor_indices = findall(donors)
     resid_idx = 0
     for (i, donor_i) in enumerate(donor_indices)
-        if esample_m1[i]
+        if i <= length(esample_m1) && esample_m1[i]
             resid_idx += 1
-            imput_resid[donor_i] = imput_resid_raw[resid_idx]
+            if resid_idx <= length(imput_resid_raw)
+                imput_resid[donor_i] = imput_resid_raw[resid_idx]
+            end
         end
     end
     
@@ -932,14 +955,14 @@ function fit_bjs(df::DataFrame;
     y0hat = fe_predict(m1, d)
     d[!, :Y0_hat] = y0hat
     
-    eff = Float64.(d[!, y]) .- Float64.(y0hat)
+    eff = Float64.(d[!, y]) .- Float64.(coalesce.(y0hat, 0.0))
     d[!, :effect] = eff
     
-    # Handle missing Y0
+    # Handle any remaining missing Y0 (should be rare after autosample)
     keep = .!ismissing.(y0hat)
     if any(.!keep)
         d = d[keep, :]
-        imput_resid = imput_resid[keep]  # Keep residuals aligned with data
+        imput_resid = imput_resid[keep]
         n = nrow(d)
         wei = isnothing(weights) ? ones(Float64, n) : Float64.(d[!, weights])
         D = d[!, :D]
@@ -1001,19 +1024,15 @@ function fit_bjs(df::DataFrame;
     
     if pretrends !== nothing && pretrends !== false
         if pretrends === true
-            # All negative horizons among treated before treatment
-            all_neg = sort(unique(filter(<(0), filter(!ismissing, K))), rev=true)  # -1, -2, -3, ...
+            all_neg = sort(unique(filter(<(0), filter(!ismissing, K))), rev=true)
             pre_horizons = all_neg
         elseif pretrends isa Int
-            # pretrends(5) means pre1 (K=-1), pre2 (K=-2), ..., pre5 (K=-5)
-            # Stata: forvalues h = 1/`pretrends' { gen pretrendvar`h' = (K==-`h') }
-            pre_horizons = collect(-1:-1:-pretrends)  # [-1, -2, -3, -4, -5]
+            pre_horizons = collect(-1:-1:-pretrends)
         else
-            pre_horizons = sort(collect(pretrends), rev=true)  # sort descending (closest to 0 first)
+            pre_horizons = sort(collect(pretrends), rev=true)
         end
         pre_horizons = filter(<(0), pre_horizons)
         
-        # Create pre-trend dummies: pre1 for K=-1, pre2 for K=-2, etc.
         for τ in pre_horizons
             nm = Symbol("pre$(abs(τ))")
             push!(pre_syms, nm)
@@ -1066,13 +1085,7 @@ function fit_bjs(df::DataFrame;
     k_ctrl = length(β_ctrl)
     
     #=== 12. Combine cluster scores and compute joint VCOV ===#
-    # Stata order: [pre-trends, tau, controls]
-    # Pre-trends in chronological order: pre5, pre4, pre3, pre2, pre1
-    
     if k_pre > 0
-        # Pre-trends are in order: pre1 (K=-1), pre2 (K=-2), ...
-        # We want chronological: pre5 (K=-5), pre4 (K=-4), ..., pre1 (K=-1)
-        # So we need to reverse the order
         E_pre_chron = E_pre[:, end:-1:1]
         β_pre_chron = β_pre[end:-1:1]
         valid_pre_idx_chron = valid_pre_idx[end:-1:1]
@@ -1082,7 +1095,6 @@ function fit_bjs(df::DataFrame;
         valid_pre_idx_chron = Int[]
     end
     
-    # Combine: [pre-trends, tau, controls]
     if k_ctrl > 0
         E_combined = hcat(E_pre_chron, E_tau, E_ctrl)
         all_β = vcat(β_pre_chron, β_tau, β_ctrl)
@@ -1091,7 +1103,6 @@ function fit_bjs(df::DataFrame;
         all_β = vcat(β_pre_chron, β_tau)
     end
     
-    # VCOV = E' * E (matches Stata's matrix accum nocon)
     Σ_full = transpose(E_combined) * E_combined
     
     #=== 13. Assemble names ===#
@@ -1107,10 +1118,7 @@ function fit_bjs(df::DataFrame;
         ["τ::$(τ)" for τ in sort(τvals)]
     end
     
-    # Pre-trend names in chronological order (pre5, pre4, pre3, pre2, pre1)
     pre_names_final = k_pre > 0 ? ["τ::-$(abs(pre_horizons[i]))" for i in valid_pre_idx_chron] : String[]
-    
-    # Control names
     ctrl_names_final = k_ctrl > 0 ? String.(valid_ctrl_syms) : String[]
     
     all_names = vcat(pre_names_final, tau_names, ctrl_names_final)
@@ -1139,18 +1147,14 @@ function fit_bjs(df::DataFrame;
     )
 end
 
+
 """
     fit_bjs_static(df::DataFrame; y, id, t, g, controls=Symbol[], fe=(id,t),
                    weights=nothing, cluster=nothing, control_type=:notyet,
-                   tol=1e-6, maxiter=1000)
+                   tol=1e-6, maxiter=1000, autosample=true)
 
 Static ATT estimator using Borusyak, Jaravel, and Spiess (2023) imputation.
-
 Wrapper for `fit_bjs(...; horizons=nothing, pretrends=nothing)`.
-See `fit_bjs` for full documentation.
-
-# Returns
-`BJSModel` with single `"_ATT"` coefficient.
 """
 function fit_bjs_static(df::DataFrame;
     y::Symbol,
@@ -1163,12 +1167,14 @@ function fit_bjs_static(df::DataFrame;
     cluster::Union{Nothing,Symbol} = nothing,
     control_type::Symbol = :notyet,
     tol::Float64 = 1e-6,
-    maxiter::Int = 1000)
+    maxiter::Int = 1000,
+    autosample::Bool = true)
     
     return fit_bjs(df; y=y, id=id, t=t, g=g,
                    controls=controls, fe=fe, weights=weights,
                    cluster=cluster, horizons=nothing, pretrends=nothing,
-                   control_type=control_type, tol=tol, maxiter=maxiter)
+                   control_type=control_type, tol=tol, maxiter=maxiter,
+                   autosample=autosample)
 end
 
 
@@ -1176,15 +1182,10 @@ end
     fit_bjs_dynamic(df::DataFrame; y, id, t, g, controls=Symbol[], fe=(id,t),
                     weights=nothing, cluster=nothing, horizons=true,
                     pretrends=true, avgeffectsby=nothing,
-                    control_type=:notyet, tol=1e-6, maxiter=1000)
+                    control_type=:notyet, tol=1e-6, maxiter=1000, autosample=true)
 
 Dynamic event-study estimator using Borusyak, Jaravel, and Spiess (2023) imputation.
-
 Wrapper for `fit_bjs` with `horizons=true` and `pretrends=true` by default.
-See `fit_bjs` for full documentation.
-
-# Returns
-`BJSModel` with `"τ::0"`, `"τ::1"`, etc. coefficients and pre-trends).
 """
 function fit_bjs_dynamic(df::DataFrame;
     y::Symbol,
@@ -1200,11 +1201,12 @@ function fit_bjs_dynamic(df::DataFrame;
     avgeffectsby::Union{Nothing,Vector{Symbol}} = nothing,
     control_type::Symbol = :notyet,
     tol::Float64 = 1e-6,
-    maxiter::Int = 1000)
+    maxiter::Int = 1000,
+    autosample::Bool = true)
     
     return fit_bjs(df; y=y, id=id, t=t, g=g,
                    controls=controls, fe=fe, weights=weights,
                    cluster=cluster, horizons=horizons, pretrends=pretrends,
                    avgeffectsby=avgeffectsby, control_type=control_type,
-                   tol=tol, maxiter=maxiter)
+                   tol=tol, maxiter=maxiter, autosample=autosample)
 end

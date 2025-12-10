@@ -1,7 +1,8 @@
 """
     fit_gardner_static(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
                      controls::Vector{Symbol}=Symbol[], cluster::Symbol,
-                     weights::Union{Nothing,Symbol}=nothing, control_type::Symbol=:notyet)
+                     weights::Union{Nothing,Symbol}=nothing, control_type::Symbol=:notyet,
+                     autosample::Bool=true)
 
 Gardner (2021) two-stage difference-in-differences estimator for static treatment effects.
 
@@ -19,9 +20,11 @@ Estimates Y(0) using donor observations, then regresses residualized outcome on 
 - `t::Symbol`: Time period (integer)
 - `g::Symbol`: Treatment cohort (period when first treated)
 - `controls::Vector{Symbol}`: Control variables for first stage
-- `cluster::Symbol`: Clustering variable for standard errors - defaults to `id` if non provided
+- `cluster::Symbol`: Clustering variable for standard errors - defaults to `id` if not provided
 - `weights::Union{Nothing,Symbol}`: Observation weights
 - `control_type::Symbol`: `:notyet` (not-yet + never treated) or `:never` (never treated only)
+- `autosample::Bool`: If true (default), drop treated observations where FE cannot be imputed.
+                      If false, error when FE cannot be imputed.
 
 # Returns
 
@@ -42,7 +45,8 @@ function fit_gardner_static(df::DataFrame;
                           controls::Vector{Symbol}=Symbol[], 
                           cluster::Symbol=id,
                           weights::Union{Nothing,Symbol}=nothing,
-                          control_type::Symbol=:notyet)
+                          control_type::Symbol=:notyet,
+                          autosample::Bool=true)
 
     d = copy(df)
     
@@ -53,8 +57,7 @@ function fit_gardner_static(df::DataFrame;
     treat = (.!ismissing.(d[!, g])) .& (d[!, g] .> 0) .& (d[!, t] .>= d[!, g])
     d[!, :_ATT] = Int.(treat)
     
-    # Count observations for diagnostics
-    n_treated = sum(d[!, :_ATT])
+    # Get donor mask
     untreated_mask = donor_mask(d; t=t, g=g, control_type=control_type)
     n_donors = sum(untreated_mask)
     
@@ -70,8 +73,6 @@ function fit_gardner_static(df::DataFrame;
         f1 = Term(y) ~ control_terms + FixedEffectModels.fe(id) + FixedEffectModels.fe(t)
     end
     
-    w_vec = isnothing(weights) ? nothing : Float64.(d[!, weights])
-    
     # Estimate first stage on untreated observations only
     untreated_data = d[untreated_mask, :]
     
@@ -86,10 +87,29 @@ function fit_gardner_static(df::DataFrame;
         0.0
     end
     
-    # Predict Y(0) on full sample using corrected fe_predict - FixedEffectModels' predict function is broken...
+    # === AUTOSAMPLE: Check which treated observations can be imputed ===
+    treated_mask = BitVector(d[!, :_ATT] .== 1)
+    keep_mask, n_dropped = apply_autosample(d, m1, treated_mask; 
+                                             autosample=autosample, verbose=true)
+    
+    if n_dropped > 0
+        # Filter the dataset
+        d = d[keep_mask, :]
+        treated_mask = BitVector(d[!, :_ATT] .== 1)
+        untreated_mask = donor_mask(d; t=t, g=g, control_type=control_type)
+    end
+    
+    # Update counts after autosample
+    n_treated = sum(d[!, :_ATT])
+    n_donors = sum(untreated_mask)
+    
+    # Update weights vector if needed
+    w_vec = isnothing(weights) ? nothing : Float64.(d[!, weights])
+    
+    # Predict Y(0) on filtered sample
     y0_pred = fe_predict(m1, d)
     
-    # Handle any missing predictions (set to 0)
+    # Handle any missing predictions (set to 0) - should be minimal after autosample
     if any(ismissing, y0_pred)
         y0_pred = coalesce.(y0_pred, 0.0)
     end
@@ -118,7 +138,6 @@ function fit_gardner_static(df::DataFrame;
     
     # Create x10 from WEIGHTED x1 
     x10_weighted = copy(x1_weighted)  # Copy the weighted matrix
-    treated_mask = d[!, :_ATT] .== 1
     treated_indices = findall(treated_mask)
     for i in treated_indices
         x10_weighted[i, :] .= 0.0  # Zero out treated rows
@@ -215,7 +234,7 @@ end
     fit_gardner_dynamic(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
                       controls::Vector{Symbol}=Symbol[], cluster::Symbol,
                       ref_p::Int=-1, weights::Union{Nothing,Symbol}=nothing,
-                      control_type::Symbol=:notyet)
+                      control_type::Symbol=:notyet, autosample::Bool=true)
 
 Gardner (2021) two-stage difference-in-differences estimator for event study analysis.
 
@@ -235,9 +254,10 @@ Event time τ = t - g, with coefficients for each τ ≠ ref_p.
 - `g::Symbol`: Treatment cohort (period when first treated)
 - `controls::Vector{Symbol}`: Control variables for first stage
 - `cluster::Symbol`: Clustering variable for standard errors
-- `ref_p::Int`: Reference period excluded from estimation (default includes all periods)
+- `ref_p::Int`: Reference period excluded from estimation (default -1)
 - `weights::Union{Nothing,Symbol}`: Observation weights  
 - `control_type::Symbol`: `:notyet` (not-yet + never treated) or `:never` (never treated only)
+- `autosample::Bool`: If true (default), drop treated observations where FE cannot be imputed.
 
 # Returns
 
@@ -255,7 +275,8 @@ function fit_gardner_dynamic(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g:
                            controls::Vector{Symbol}=Symbol[], cluster::Symbol=id,
                            ref_p::Int=-1,
                            weights::Union{Nothing,Symbol}=nothing,
-                           control_type::Symbol=:notyet)
+                           control_type::Symbol=:notyet,
+                           autosample::Bool=true)
 
     d = copy(df)
     
@@ -269,18 +290,13 @@ function fit_gardner_dynamic(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g:
     # Create event time 
     make_eventtime!(d; t=t, g=g, new=:ttt, ref_p=ref_p)
     
-    # Count observations for diagnostics
-    n_treated = sum(d[!, :_ATT])
+    # Get donor mask
     untreated_mask = donor_mask(d; t=t, g=g, control_type=control_type)
     n_donors = sum(untreated_mask)
     
     if n_donors == 0
         error("No untreated observations found")
     end
-    
-    # Extract treatment periods for diagnostics (excluding reference)
-    unique_event_times = sort(unique(d[!, :ttt]))
-    treatment_periods = filter(x -> x != ref_p, unique_event_times)
     
     # Build first stage formula
     if isempty(controls)
@@ -304,6 +320,28 @@ function fit_gardner_dynamic(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g:
     catch
         0.0
     end
+
+    # === AUTOSAMPLE: Check which treated observations can be imputed ===
+    treated_mask = BitVector(d[!, :_ATT] .== 1)
+    keep_mask, n_dropped = apply_autosample(d, m1, treated_mask; 
+                                             autosample=autosample, verbose=true)
+    
+    if n_dropped > 0
+        # Filter the dataset
+        d = d[keep_mask, :]
+        treated_mask = BitVector(d[!, :_ATT] .== 1)
+        untreated_mask = donor_mask(d; t=t, g=g, control_type=control_type)
+        # Update weights
+        wvec = isnothing(weights) ? nothing : Float64.(d[!, weights])
+    end
+    
+    # Update counts after autosample
+    n_treated = sum(d[!, :_ATT])
+    n_donors = sum(untreated_mask)
+    
+    # Extract treatment periods for diagnostics (excluding reference)
+    unique_event_times = sort(unique(d[!, :ttt]))
+    treatment_periods = filter(x -> x != ref_p, unique_event_times)
 
     # Residualize outcome 
     y_pred = fe_predict(m1, d)

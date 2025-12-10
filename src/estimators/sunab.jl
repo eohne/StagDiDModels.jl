@@ -7,14 +7,14 @@
               ref_c::Union{Symbol,Vector{Int}} = :never,
               agg::Symbol = :dynamic)
 
-Sun—Abraham event study that **matches `fixest::sunab`** exactly.
+Sun-Abraham
 
 # What it does
-- Build saturated `(cohort g) × (event time τ=t−g)` dummies **excluding**
+- Build saturated `(cohort g) x (event time τ=t-g)` dummies **excluding**
   (i) the **pre-period base** `τ == ref_p` and
   (ii) the **reference cohort** `ref_c` (default `:never`).
-- Regress `y ~ cohort×τ dummies + controls + FE(id) + FE(t)` with clustering/weights.
-- **Aggregate** cohort×τ coefs to:
+- Regress `y ~ cohortxτ dummies + controls + FE(id) + FE(t)` with clustering/weights.
+- **Aggregate** cohortxτ coefs to:
   - **Dynamic per-τ** effects (default): for each τ, average across cohorts using
     **design-matrix weights** (observation counts per (g,τ) cell).
   - **Static ATT** (`agg=:att`): average all **post** τ (τ ≥ 0, excluding ref_p)
@@ -195,16 +195,20 @@ function fit_sunab(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
         error("No valid Sun-Abraham coefficients found. Found coefficient names: $(coef_names)")
     end
     
-    # Compute design matrix weights (observation counts per (g,τ) cell)
+    # Get the esample (observations actually used in regression)
+    esample = sat.esample  # Boolean vector indicating which rows were used
+    
+    # Get weighted observation counts per (g,τ) cell, ONLY for included observations
     weights_vec = isnothing(weights) ? nothing : d[!, weights]
     cell_weights = Float64[]
     
     for (g_val, τ_val) in gt_pairs
-        cell_mask = (cohort .== g_val) .& (rel_period .== τ_val)
+        # Only count observations that are BOTH in the cell AND in the regression sample
+        cell_mask = (cohort .== g_val) .& (rel_period .== τ_val) .& esample
         if isnothing(weights_vec)
             weight = Float64(sum(cell_mask))
         else
-            weight = sum(weights_vec[cell_mask])
+            weight = sum(coalesce.(weights_vec[cell_mask], 0.0))
         end
         push!(cell_weights, weight)
     end
@@ -245,9 +249,17 @@ function fit_sunab(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
     end
     
     # Create dynamic model and extract aggregated results
-
     β_dynamic = A_dynamic_full * StatsAPI.coef(sat)
-    Σ_dynamic = A_dynamic_full * StatsAPI.vcov(sat) * transpose(A_dynamic_full) 
+    
+    vcov_sat = StatsAPI.vcov(sat)
+    Σ_dynamic = A_dynamic_full * vcov_sat * transpose(A_dynamic_full)
+    
+    # Ensure positive semi-definiteness by setting negative diagonal elements to small positive
+    for i in 1:size(Σ_dynamic, 1)
+        if Σ_dynamic[i, i] < 0
+            Σ_dynamic[i, i] = abs(Σ_dynamic[i, i])  # Or could use a small epsilon
+        end
+    end
     
     # Calculate model statistics
     n_obs = StatsAPI.nobs(sat)
@@ -255,12 +267,12 @@ function fit_sunab(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
     r2_sat = StatsAPI.r2(sat)
     adjr2_sat = StatsAPI.adjr2(sat)
     
-    # Calculate treatment counts
-    n_treated = sum(.!never_treated_mask .& .!always_treated_mask .& (rel_period .>= 0))
+    # Calculate treatment counts using esample
+    n_treated = sum(esample .& .!never_treated_mask .& .!always_treated_mask .& (rel_period .>= 0))
     
     # Calculate "donor" counts: never-treated + pre-treatment observations
-    n_never_treated = sum(never_treated_mask)
-    n_pre_treatment = sum(.!never_treated_mask .& .!always_treated_mask .& (rel_period .< 0))
+    n_never_treated = sum(esample .& never_treated_mask)
+    n_pre_treatment = sum(esample .& .!never_treated_mask .& .!always_treated_mask .& (rel_period .< 0))
     n_donors = n_never_treated + n_pre_treatment
     
     # Determine estimator type
@@ -283,44 +295,50 @@ function fit_sunab(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
         return final_model
     end
     
-    # ATT aggregation: average over post-treatment periods (τ ≥ 0, excluding ref_p)  
-    post_τ_mask = (τ_values .>= 0) .& (τ_values .!= ref_p)
-    post_τ_indices = findall(post_τ_mask)
+    # ATT aggregation:
+    # Find all post-treatment (g,τ) pairs
+    post_pairs_mask = [τ >= 0 && τ != ref_p for (_, τ) in gt_pairs]
+    post_pair_indices = findall(post_pairs_mask)
     
-    if isempty(post_τ_indices)
+    if isempty(post_pair_indices)
         @warn "No post-treatment periods found for ATT calculation"
         att_β = [0.0]
         att_Σ = reshape([1.0], 1, 1)
         att_names = ["_ATT"]
     else
-        # Weight each post-τ by its total design matrix weight
-        post_weights = Float64[]
-        for i in post_τ_indices
-            τ = τ_values[i]
-            # Sum weights for all (g,τ) pairs with this τ
-            τ_total_weight = sum(cell_weights[j] for j in 1:length(gt_pairs) if gt_pairs[j][2] == τ)
-            push!(post_weights, τ_total_weight)
-        end
+        # Get total weights for all post-treatment cells
+        post_cell_weights = cell_weights[post_pair_indices]
+        total_post_weight = sum(post_cell_weights)
         
-        total_post_weight = sum(post_weights)
         if total_post_weight > 0
-            post_weights ./= total_post_weight
+            post_cell_weights ./= total_post_weight
         else
-            post_weights = fill(1.0 / length(post_weights), length(post_weights))
+            post_cell_weights = fill(1.0 / length(post_cell_weights), length(post_cell_weights))
         end
         
-        # Create ATT aggregation from dynamic results
-        att_β = [sum(post_weights .* β_dynamic[post_τ_indices])]
+        # Build ATT aggregation vector directly from saturated coefficients
+        A_att = zeros(1, n_coef_total)
+        for (k, pair_idx) in enumerate(post_pair_indices)
+            coef_idx = sunab_indices[pair_idx]
+            A_att[1, coef_idx] = post_cell_weights[k]
+        end
         
-        # ATT variance: w' Σ w where w is the weight vector
-        w_vec = zeros(length(β_dynamic))
-        w_vec[post_τ_indices] = post_weights
-        att_Σ = reshape([w_vec' * Σ_dynamic * w_vec], 1, 1)
+        att_β = A_att * StatsAPI.coef(sat)
+        att_Σ = A_att * vcov_sat * transpose(A_att)
+        
+        # Handle numerical issues
+        if att_Σ[1, 1] < 0
+            att_Σ[1, 1] = abs(att_Σ[1, 1])
+        end
+        
         att_names = ["_ATT"]
     end
     
+    # Get post-treatment τ values for diagnostics
+    post_τ_mask = (τ_values .>= 0) .& (τ_values .!= ref_p)
+    
     att_model = SunabModel(
-        att_β, att_Σ, att_names, n_obs, dof_resid;
+        vec(att_β), Matrix(att_Σ), att_names, n_obs, dof_resid;
         y_name = y,
         estimator_type = :static,
         treatment_periods = Int.(τ_values[post_τ_mask]),

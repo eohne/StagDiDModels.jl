@@ -110,7 +110,7 @@ function cumulative_effects(m::StatsAPI.StatisticalModel;
             upper_bound = isnothing(ref_period) ? -1 : ref_period - 1
             for (j, τ_other) in enumerate(τ_values)
                 if τ_other >= τ && τ_other <= upper_bound
-                    A[i, coef_indices[j]] = 1.0
+                    A[i, coef_indices[j]] = -1.0
                 end
             end
         end
