@@ -161,17 +161,24 @@ function fit_sunab(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
     
     # Fit saturated regression
     vc = build_cluster_vcov(cluster)
-    reg_weights = isnothing(weights) ? nothing : d[!, weights]
     
     sat = reg(d, f, vc; weights=weights)
     
     # Extract coefficients for cohort x period interactions
     coef_names = StatsAPI.coefnames(sat)
-    β = StatsAPI.coef(sat)
+    β_all = StatsAPI.coef(sat)
+    vcov_sat = StatsAPI.vcov(sat)
     
-    # Find sunab interaction coefficients (note the space after colon!)
-    sunab_indices = Int[]
-    gt_pairs = Tuple{Int,Int}[]
+    # FixedEffectModels keeps collinear coefficients with coef=0 and var=NaN
+    # We must exclude these from aggregation
+     
+    # Get diagonal of vcov to check for NaN/invalid variances
+    vcov_diag = diag(vcov_sat)
+    
+    # Find sunab interaction coefficients AND filter out collinear ones
+    sunab_indices = Int[]           # Index in FULL coefficient vector
+    gt_pairs = Tuple{Int,Int}[]     # (cohort, relative_period) pairs
+    valid_coef_mask = Bool[]        # Which are actually estimated (not collinear)
     
     for (i, name) in enumerate(coef_names)
         if startswith(name, "sunab_key: ") && name != "sunab_key: REF"
@@ -184,6 +191,11 @@ function fit_sunab(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
                     τ_val = parse(Int, parts[2])
                     push!(sunab_indices, i)
                     push!(gt_pairs, (g_val, τ_val))
+                    
+                    # Check if this coefficient is actually estimated (not collinear)
+                    # Collinear coefficients have: coef ≈ 0 AND (variance is NaN or ≈ 0)
+                    is_valid = !isnan(vcov_diag[i]) && !isinf(vcov_diag[i]) && vcov_diag[i] > 1e-20
+                    push!(valid_coef_mask, is_valid)
                 catch
                     # Skip if parsing fails
                 end
@@ -195,40 +207,63 @@ function fit_sunab(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
         error("No valid Sun-Abraham coefficients found. Found coefficient names: $(coef_names)")
     end
     
-    # Get the esample (observations actually used in regression)
-    esample = sat.esample  # Boolean vector indicating which rows were used
+    # Count how many were dropped due to collinearity
+    n_collinear = sum(.!valid_coef_mask)
+    if n_collinear > 0
+        dropped_pairs = gt_pairs[.!valid_coef_mask]
+        @info "Excluding $n_collinear collinear cohort×period interactions from aggregation: $(dropped_pairs)"
+    end
     
-    # Get weighted observation counts per (g,τ) cell, ONLY for included observations
+    # Get the esample (observations actually used in regression)
+    esample = sat.esample
+    
+    # Get weighted observation counts per (g,τ) cell, ONLY for:
+    # 1. Observations in the regression sample (esample)
+    # 2. Coefficients that are actually estimated (valid_coef_mask)
     weights_vec = isnothing(weights) ? nothing : d[!, weights]
     cell_weights = Float64[]
     
-    for (g_val, τ_val) in gt_pairs
-        # Only count observations that are BOTH in the cell AND in the regression sample
-        cell_mask = (cohort .== g_val) .& (rel_period .== τ_val) .& esample
-        if isnothing(weights_vec)
-            weight = Float64(sum(cell_mask))
+    for (idx, (g_val, τ_val)) in enumerate(gt_pairs)
+        if valid_coef_mask[idx]
+            # Only count observations that are in the regression sample
+            cell_mask = (cohort .== g_val) .& (rel_period .== τ_val) .& esample
+            if isnothing(weights_vec)
+                weight = Float64(sum(cell_mask))
+            else
+                weight = sum(coalesce.(weights_vec[cell_mask], 0.0))
+            end
         else
-            weight = sum(coalesce.(weights_vec[cell_mask], 0.0))
+            # Collinear coefficient - set weight to 0 (will be excluded from aggregation)
+            weight = 0.0
         end
         push!(cell_weights, weight)
     end
     
-    # Get unique τ values and sort them
-    τ_values = sort(unique(last.(gt_pairs)))
-    n_τ = length(τ_values)
-    n_coef_total = length(coef_names)
+    # Build REDUCED coefficient vector and vcov (excluding collinear)    
+    valid_sunab_indices = sunab_indices[valid_coef_mask]
+    valid_gt_pairs = gt_pairs[valid_coef_mask]
+    valid_cell_weights = cell_weights[valid_coef_mask]
     
-    # Build dynamic aggregation matrix:
-    A_dynamic_full = zeros(n_τ, n_coef_total)
+    # Extract only the valid coefficients and their vcov submatrix
+    β_valid = β_all[valid_sunab_indices]
+    vcov_valid = vcov_sat[valid_sunab_indices, valid_sunab_indices]
+    
+    # Get unique τ values (only from VALID coefficients)
+    τ_values = sort(unique(last.(valid_gt_pairs)))
+    n_τ = length(τ_values)
+    n_valid = length(valid_sunab_indices)
+    
+    # Build dynamic aggregation matrix (now operating on VALID coefficients only)
+    A_dynamic = zeros(n_τ, n_valid)
     dynamic_names = String[]
     
     for (τ_idx, τ) in enumerate(τ_values)
-        # Find all (g,τ) pairs with this τ
-        matching_pairs = [(i, gt_pairs[i]) for i in 1:length(gt_pairs) if gt_pairs[i][2] == τ]
+        # Find all valid (g,τ) pairs with this τ
+        matching_indices = [i for i in 1:length(valid_gt_pairs) if valid_gt_pairs[i][2] == τ]
         
-        if !isempty(matching_pairs)
+        if !isempty(matching_indices)
             # Get weights for this τ
-            τ_weights = [cell_weights[i] for (i, _) in matching_pairs]
+            τ_weights = [valid_cell_weights[i] for i in matching_indices]
             total_weight = sum(τ_weights)
             
             # Normalize weights 
@@ -239,27 +274,17 @@ function fit_sunab(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
             end
             
             # Set aggregation weights
-            for (k, (pair_idx, _)) in enumerate(matching_pairs)
-                coef_idx = sunab_indices[pair_idx]  # Index in full coefficient vector
-                A_dynamic_full[τ_idx, coef_idx] = τ_weights[k]
+            for (k, valid_idx) in enumerate(matching_indices)
+                A_dynamic[τ_idx, valid_idx] = τ_weights[k]
             end
         end
         
         push!(dynamic_names, "τ::$(τ)")
     end
     
-    # Create dynamic model and extract aggregated results
-    β_dynamic = A_dynamic_full * StatsAPI.coef(sat)
-    
-    vcov_sat = StatsAPI.vcov(sat)
-    Σ_dynamic = A_dynamic_full * vcov_sat * transpose(A_dynamic_full)
-    
-    # Ensure positive semi-definiteness by setting negative diagonal elements to small positive
-    for i in 1:size(Σ_dynamic, 1)
-        if Σ_dynamic[i, i] < 0
-            Σ_dynamic[i, i] = abs(Σ_dynamic[i, i])  # Or could use a small epsilon
-        end
-    end
+    # Compute aggregated dynamic effects
+    β_dynamic = A_dynamic * β_valid
+    Σ_dynamic = A_dynamic * vcov_valid * transpose(A_dynamic)
     
     # Calculate model statistics
     n_obs = StatsAPI.nobs(sat)
@@ -295,19 +320,19 @@ function fit_sunab(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
         return final_model
     end
     
-    # ATT aggregation:
-    # Find all post-treatment (g,τ) pairs
-    post_pairs_mask = [τ >= 0 && τ != ref_p for (_, τ) in gt_pairs]
-    post_pair_indices = findall(post_pairs_mask)
+    # ATT aggregation: Aggregate DIRECTLY from VALID saturated coefficients
+    # Find all post-treatment valid (g,τ) pairs
+    post_mask = [(τ >= 0 && τ != ref_p) for (_, τ) in valid_gt_pairs]
+    post_indices = findall(post_mask)
     
-    if isempty(post_pair_indices)
+    if isempty(post_indices)
         @warn "No post-treatment periods found for ATT calculation"
         att_β = [0.0]
-        att_Σ = reshape([1.0], 1, 1)
+        att_Σ = reshape([0.0], 1, 1)
         att_names = ["_ATT"]
     else
         # Get total weights for all post-treatment cells
-        post_cell_weights = cell_weights[post_pair_indices]
+        post_cell_weights = valid_cell_weights[post_indices]
         total_post_weight = sum(post_cell_weights)
         
         if total_post_weight > 0
@@ -316,21 +341,14 @@ function fit_sunab(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
             post_cell_weights = fill(1.0 / length(post_cell_weights), length(post_cell_weights))
         end
         
-        # Build ATT aggregation vector directly from saturated coefficients
-        A_att = zeros(1, n_coef_total)
-        for (k, pair_idx) in enumerate(post_pair_indices)
-            coef_idx = sunab_indices[pair_idx]
-            A_att[1, coef_idx] = post_cell_weights[k]
+        # Build ATT aggregation vector from valid coefficients
+        A_att = zeros(1, n_valid)
+        for (k, idx) in enumerate(post_indices)
+            A_att[1, idx] = post_cell_weights[k]
         end
         
-        att_β = A_att * StatsAPI.coef(sat)
-        att_Σ = A_att * vcov_sat * transpose(A_att)
-        
-        # Handle numerical issues
-        if att_Σ[1, 1] < 0
-            att_Σ[1, 1] = abs(att_Σ[1, 1])
-        end
-        
+        att_β = A_att * β_valid
+        att_Σ = A_att * vcov_valid * transpose(A_att)
         att_names = ["_ATT"]
     end
     

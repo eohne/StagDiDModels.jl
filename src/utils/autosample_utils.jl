@@ -3,11 +3,9 @@
     check_fe_imputable(model::FixedEffectModel, newdata::DataFrame, treated_mask::BitVector)
 
 Check which treated observations have fixed effect levels that can be imputed 
-from the first-stage model (i.e., FE levels that appear in the donor sample).
+from the first-stage model.
 
 Returns a BitVector where `true` means the observation CAN be imputed.
-
-This mimics Stata's `did_imputation` autosample behavior.
 """
 function check_fe_imputable(model::FixedEffectModel, newdata::DataFrame, treated_mask::BitVector)
     n = nrow(newdata)
@@ -17,22 +15,37 @@ function check_fe_imputable(model::FixedEffectModel, newdata::DataFrame, treated
         return can_impute
     end
     
-    # Get the FE levels that were estimated in the first stage (donor sample)
     fe_df = model.fe
     
+    if nrow(fe_df) == 0
+        @warn "Model has no saved FE estimates"
+        return can_impute
+    end
+    
     for k in model.fekeys
-        # Get the FE values that exist in the first-stage model
         fe_col_name = "fe_" * string(k)
         if !(fe_col_name in names(fe_df))
             continue
         end
         
-        # Get unique FE levels from the model (dropping missings)
-        available_fe = Set(skipmissing(fe_df[!, k]))
+        # FIX: Get FE levels that have NON-MISSING coefficients
+        # This is what fe_predict actually uses (it does dropmissing)
+        fe_levels_col = fe_df[!, k]
+        fe_coefs_col = fe_df[!, fe_col_name]
         
-        # Check each observation
+        # Only include levels where coefficient is not missing
+        available_fe = Set{eltype(fe_levels_col)}()
+        for i in 1:length(fe_levels_col)
+            level = fe_levels_col[i]
+            coef = fe_coefs_col[i]
+            if !ismissing(level) && !ismissing(coef)
+                push!(available_fe, level)
+            end
+        end
+        
+        # Check each treated observation
         for i in 1:n
-            if treated_mask[i]  # Only check treated observations
+            if treated_mask[i]
                 obs_fe_val = newdata[i, k]
                 if ismissing(obs_fe_val) || !(obs_fe_val in available_fe)
                     can_impute[i] = false
@@ -49,19 +62,7 @@ end
     apply_autosample(d::DataFrame, model::FixedEffectModel, treated_mask::BitVector;
                      autosample::Bool=true, verbose::Bool=true)
 
-Apply Stata-style autosample: identify and optionally drop treated observations 
-where fixed effects cannot be imputed from the donor sample.
-
-# Arguments
-- `d::DataFrame`: The full dataset
-- `model::FixedEffectModel`: First-stage model fitted on donors
-- `treated_mask::BitVector`: Mask indicating which observations are treated
-- `autosample::Bool`: If true, drop problematic observations. If false, error.
-- `verbose::Bool`: If true, print warnings about dropped observations.
-
-# Returns
-- `keep_mask::BitVector`: Mask of observations to keep
-- `n_dropped::Int`: Number of dropped observations
+Apply Stata-style autosample: drop treated observations where FE cannot be imputed.
 """
 function apply_autosample(d::DataFrame, model::FixedEffectModel, treated_mask::BitVector;
                           autosample::Bool=true, verbose::Bool=true)
@@ -71,7 +72,6 @@ function apply_autosample(d::DataFrame, model::FixedEffectModel, treated_mask::B
     n_cannot_impute = sum(cannot_impute_mask)
     
     if n_cannot_impute == 0
-        # All observations can be imputed
         return trues(nrow(d)), 0
     end
     
@@ -81,7 +81,8 @@ function apply_autosample(d::DataFrame, model::FixedEffectModel, treated_mask::B
     end
     
     if verbose
-        @warn "Dropping $n_cannot_impute treated observations where FE could not be imputed from donor sample."
+        n_total = sum(treated_mask)
+        @warn "Autosample: dropping $n_cannot_impute / $n_total treated obs where FE coefficient is missing (singleton or not in donor sample)"
     end
     
     keep_mask = .!cannot_impute_mask

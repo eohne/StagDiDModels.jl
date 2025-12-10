@@ -116,7 +116,9 @@ function fit_gardner_static(df::DataFrame;
     y0_pred = Float64.(y0_pred)
     
     # Create residualized outcome: ytilde = y - y0_pred
-    d[!, :ytilde] = Float64.(d[!, y]) .- y0_pred
+    d[!, :ytilde] = [
+        (ismissing(d[i, y]) || ismissing(y0_pred[i])) ? 0.0 : Float64(d[i, y]) - Float64(y0_pred[i])
+        for i in 1:nrow(d)]
     
     # Stage 2: Regress residualized outcome on computed treatment indicator
     f2 = Term(:ytilde) ~ term(0) + term(:_ATT)
@@ -144,7 +146,12 @@ function fit_gardner_static(df::DataFrame;
     end
     
     # Residuals
-    second_u = residuals(m2, d) .* w # second stage residuals
+    second_u_raw = residuals(m2, d)
+    second_u = Vector{Float64}(undef, length(second_u_raw))
+    for i in eachindex(second_u_raw)
+        val = second_u_raw[i]
+        second_u[i] = ismissing(val) ? 0.0 : Float64(val) * w[i]
+    end
     first_u = copy(d[!, :ytilde]) .* w  # first stage residuals 
     first_u[treated_mask] .= 0.0  # zero on treated 
     
@@ -200,7 +207,8 @@ function fit_gardner_static(df::DataFrame;
     second_stage_adjr2 = StatsAPI.adjr2(m2,:McFadden)
 
     # Get weighted R2:
-    residuals_vals = residuals(m2,d)  # second stage residuals
+    residuals_raw = residuals(m2, d)
+    residuals_vals = [ismissing(v) ? 0.0 : Float64(v) for v in residuals_raw]
     y_vals = d[!, :ytilde]  # the outcome in second stage
     if !isnothing(w_vec)
         w_sum = sum(w_vec)

@@ -4,12 +4,12 @@ function quiet_reg(args...; kwargs...)
     end
 end
 """
-    update_weights_control_fixed!(W, x; donors, touse, wei)
+    update_weights_control!(W, x; donors, touse, wei)
 
 Orthogonalize each column of W with respect to regressor x.
 Numerator sums over ALL observations, update applies only to donors.
 """
-function update_weights_control_fixed!(
+function update_weights_control!(
     W::AbstractMatrix{<:Real},
     x::AbstractVector{<:Real};
     donors::AbstractVector{Bool},
@@ -52,12 +52,12 @@ function update_weights_control_fixed!(
 end
 
 """
-    update_weights_fe_fixed!(W, fe; donors, touse, wei)
+    update_weights_fe!(W, fe; donors, touse, wei)
 
 Orthogonalize each column of W with respect to FE dummies.
 Numerator sums over ALL observations, update applies only to donors.
 """
-function update_weights_fe_fixed!(
+function update_weights_fe!(
     W::AbstractMatrix{<:Real},
     fe::AbstractVector;
     donors::AbstractVector{Bool},
@@ -114,11 +114,11 @@ function update_weights_fe_fixed!(
 end
 
 """
-    compute_influence_weights_fixed!(df, wtr_syms, controls, fe_syms, D_sym, wei_sym; ...)
+    compute_influence_weights!(df, wtr_syms, controls, fe_syms, D_sym, wei_sym; ...)
 
 Compute influence weights via iterative orthogonalization.
 """
-function compute_influence_weights_fixed!(
+function compute_influence_weights!(
     df::DataFrame,
     wtr_syms::Vector{Symbol},
     controls::Vector{Symbol},
@@ -186,13 +186,13 @@ function compute_influence_weights_fixed!(
             if denom <= 1e-14
                 continue
             end
-            update_weights_control_fixed!(W, x_dm; donors=donors, touse=touse, wei=wei)
+            update_weights_control!(W, x_dm; donors=donors, touse=touse, wei=wei)
         end
         
         # 2) Fixed effects
         for fe in fe_syms
             fe_vec = df[!, fe]
-            update_weights_fe_fixed!(W, fe_vec; donors=donors, touse=touse, wei=wei)
+            update_weights_fe!(W, fe_vec; donors=donors, touse=touse, wei=wei)
         end
         
         # 3) Convergence check: SUM of absolute changes (matches Stata)
@@ -211,7 +211,7 @@ function compute_influence_weights_fixed!(
     end
     
     if iter == maxiter
-        @warn "compute_influence_weights_fixed!: did not converge within $maxiter iterations"
+        @warn "compute_influence_weights!: did not converge within $maxiter iterations"
     end
     
     return W, iter
@@ -407,32 +407,21 @@ function compute_cluster_scores_pretrends!(
     m_pre = quiet_reg(d_donors, f_pre; weights=weights, save=:residuals,progress_bar=false)
     
     # Compute DOF adjustment exactly as Stata does (line 564 of did_imputation.ado)
-    # Stata: dof_adj = (e(N)-1)/(e(N)-e(df_m)-e(df_a)) * (e(N_clust)/(e(N_clust)-1))
-    #
-    # CRITICAL: Stata's reghdfe treats FE that are nested within the cluster as redundant
-    # for DOF computation. So if we cluster by `i` and have fe(i) + fe(t):
-    #   - Unit FE (i): ALL redundant (nested in cluster) = 0 DOF
-    #   - Time FE (t): X categories, 1 redundant = X-1 DOF
-    
     N_pre = nobs(m_pre)
-    df_m_pre = dof(m_pre)  # Number of estimated coefficients (pre-trend dummies)
+    df_m_pre = dof(m_pre)
     N_clust_pre = isnothing(cluster) ? N_pre : length(unique(d_donors[m_pre.esample, cluster]))
     
     # Compute df_a properly: only count FE that are NOT nested within the cluster
-    # FE nested in cluster contribute 0 to df_a
     df_a_pre = 0
     for fe_var in fe
         fe_col = d_donors[m_pre.esample, fe_var]
         n_levels = length(unique(fe_col))
         
         if isnothing(cluster)
-            # No clustering - all FE contribute normally (n_levels - 1)
             df_a_pre += n_levels - 1
         elseif fe_var == cluster
-            # This FE is the same as cluster variable - fully nested, contributes 0
+            # FE same as cluster - contributes 0
         else
-            # Check if this FE is nested within cluster
-            # (each FE level appears in only one cluster)
             cluster_col = d_donors[m_pre.esample, cluster]
             is_nested = true
             fe_to_cluster = Dict{eltype(fe_col), Set{eltype(cluster_col)}}()
@@ -447,16 +436,12 @@ function compute_cluster_scores_pretrends!(
                 end
             end
             
-            if is_nested
-                # FE is nested within cluster - contributes 0 DOF
-            else
-                # FE is NOT nested - contributes (n_levels - 1) DOF
+            if !is_nested
                 df_a_pre += n_levels - 1
             end
         end
     end
     
-    # Stata's formula
     denom = N_pre - df_m_pre - df_a_pre
     if denom <= 0
         denom = 1
@@ -477,7 +462,6 @@ function compute_cluster_scores_pretrends!(
         if idx !== nothing
             b = pre_coefs_all[idx]
             se = pre_se_all[idx]
-            # Omitted/collinear if: coef ≈ 0 AND (se ≈ 0 OR se is NaN/Inf)
             is_omitted = abs(b) < 1e-10 && (abs(se) < 1e-10 || !isfinite(se))
             if !is_omitted
                 push!(pre_β, b)
@@ -486,7 +470,7 @@ function compute_cluster_scores_pretrends!(
             end
         end
     end
-    # Warn about omitted pre-trends (rare, but possible)
+    
     omitted_pre = setdiff(pre_syms, valid_pre_syms)
     if !isempty(omitted_pre)
         @warn "Collinear pre-trends omitted: $(join(omitted_pre, ", "))"
@@ -498,16 +482,17 @@ function compute_cluster_scores_pretrends!(
     
     # 2. Get preresid and map back to full dataset using esample
     preresid_raw = residuals(m_pre)
-    esample = m_pre.esample  # Boolean vector of length n_donors
+    esample = m_pre.esample
     
     # Map residuals back to full dataset
     preresid = zeros(Float64, n)
-    resid_idx = 0
     for i in 1:n_donors
-        if esample[i]
-            resid_idx += 1
-            orig_row = d_donors[i, :__orig_row]
-            preresid[orig_row] = preresid_raw[resid_idx]
+        if i <= length(esample) && esample[i] && i <= length(preresid_raw)
+            val = preresid_raw[i]
+            if !ismissing(val)
+                orig_row = d_donors[i, :__orig_row]
+                preresid[orig_row] = Float64(val)
+            end
         end
     end
     
@@ -517,10 +502,8 @@ function compute_cluster_scores_pretrends!(
     for (j, sym) in enumerate(valid_pre_syms)
         pre_dummy = Float64.(d[!, sym])
         
-        # Build list of other valid pre-trends
         other_pre = filter(s -> s != sym, valid_pre_syms)
         
-        # Residualize the pre-dummy on other pre-dummies + controls + FE
         rhs_terms = []
         if !isempty(controls)
             push!(rhs_terms, sum(term.(controls)))
@@ -541,12 +524,13 @@ function compute_cluster_scores_pretrends!(
         
         # Map back to full dataset and multiply by wei
         preweight = zeros(Float64, n)
-        resid_idx = 0
         for i in 1:n_donors
-            if esample_resid[i]
-                resid_idx += 1
-                orig_row = d_donors[i, :__orig_row]
-                preweight[orig_row] = preweight_raw[resid_idx] * wei[orig_row]
+            if i <= length(esample_resid) && esample_resid[i] && i <= length(preweight_raw)
+                val = preweight_raw[i]
+                if !ismissing(val)
+                    orig_row = d_donors[i, :__orig_row]
+                    preweight[orig_row] = Float64(val) * wei[orig_row]
+                end
             end
         end
         
@@ -566,7 +550,7 @@ function compute_cluster_scores_pretrends!(
             end
         end
         
-        # Compute cluster scores: egen eps = total(preweight * preresid) if touse, by(cluster)
+        # Compute cluster scores
         for i in 1:n
             if touse[i]
                 g_idx = cluster_idx_map[cluster_vec[i]]
@@ -574,7 +558,6 @@ function compute_cluster_scores_pretrends!(
             end
         end
         
-        # Apply DOF adjustment: Stata line 584
         E_pre[:, j] .*= sqrt(dof_adj_pre)
     end
     
@@ -585,9 +568,6 @@ end
     compute_cluster_scores_controls!(...)
 
 Compute cluster scores for control variable coefficients.
-These use the first-stage imputation residual (Y - Y0 among donors).
-
-Follows Stata did_imputation.ado lines ~420-460.
 """
 function compute_cluster_scores_controls!(
     d::DataFrame,
@@ -598,7 +578,7 @@ function compute_cluster_scores_controls!(
     cluster_ids::Vector,
     cluster::Union{Nothing,Symbol},
     weights::Union{Nothing,Symbol},
-    imput_resid::Vector{Float64};  # First-stage residual (effect for donors, 0 for treated)
+    imput_resid::Vector{Float64};
     y::Symbol,
     touse_sym::Symbol = :__touse
     )
@@ -614,19 +594,16 @@ function compute_cluster_scores_controls!(
     touse = d[!, touse_sym]
     donor_mask = donors .& touse
     
-    # Build cluster index mapping
     cluster_idx_map = Dict{eltype(cluster_vec), Int}()
     for (idx, g_val) in enumerate(cluster_ids)
         cluster_idx_map[g_val] = idx
     end
     
-    # Create donor subset with original row indices
     donor_global_idx = findall(donor_mask)
     d_donors = copy(d[donor_mask, :])
     d_donors[!, :__orig_row] = donor_global_idx
     n_donors = nrow(d_donors)
     
-    # Run first-stage regression to get control coefficients and DOF adjustment
     fe_terms = sum(FixedEffectModels.fe.(fe))
     if isempty(controls)
         return zeros(Float64, G, 0), Float64[], Symbol[]
@@ -637,17 +614,14 @@ function compute_cluster_scores_controls!(
     
     m_ctrl = quiet_reg(d_donors, f_ctrl; weights=weights, save=:residuals,progress_bar=false)
     
-    # Extract control coefficients
     ctrl_coefnames = coefnames(m_ctrl)
     ctrl_coefs_all = coef(m_ctrl)
     ctrl_se_all = stderror(m_ctrl)
     
-    # Compute DOF adjustment (same logic as pre-trends)
     N_ctrl = nobs(m_ctrl)
     df_m_ctrl = dof(m_ctrl)
     N_clust_ctrl = isnothing(cluster) ? N_ctrl : length(unique(d_donors[m_ctrl.esample, cluster]))
     
-    # Compute df_a accounting for nested FE
     df_a_ctrl = 0
     for fe_var in fe
         fe_col = d_donors[m_ctrl.esample, fe_var]
@@ -658,7 +632,6 @@ function compute_cluster_scores_controls!(
         elseif fe_var == cluster
             # FE same as cluster - contributes 0
         else
-            # Check if nested
             cluster_col = d_donors[m_ctrl.esample, cluster]
             is_nested = true
             fe_to_cluster = Dict{eltype(fe_col), Set{eltype(cluster_col)}}()
@@ -685,7 +658,6 @@ function compute_cluster_scores_controls!(
     end
     dof_adj_ctrl = ((N_ctrl - 1) / denom) * (N_clust_ctrl / max(N_clust_ctrl - 1, 1))
     
-    # Get valid (non-omitted) controls
     β_ctrl = Float64[]
     valid_ctrl_syms = Symbol[]
     valid_ctrl_idx = Int[]
@@ -695,7 +667,6 @@ function compute_cluster_scores_controls!(
         if idx !== nothing
             b = ctrl_coefs_all[idx]
             se = ctrl_se_all[idx]
-            # Omitted/collinear if: coef ≈ 0 AND (se ≈ 0 OR se is NaN/Inf)
             is_omitted = abs(b) < 1e-10 && (abs(se) < 1e-10 || !isfinite(se))
             if !is_omitted
                 push!(β_ctrl, b)
@@ -704,7 +675,7 @@ function compute_cluster_scores_controls!(
             end
         end
     end
-    # Warn about omitted controls
+    
     omitted_ctrls = setdiff(controls, valid_ctrl_syms)
     if !isempty(omitted_ctrls)
         @warn "Collinear controls omitted: $(join(omitted_ctrls, ", "))"
@@ -714,16 +685,13 @@ function compute_cluster_scores_controls!(
         return zeros(Float64, G, 0), Float64[], Symbol[]
     end
     
-    # Compute cluster scores for each valid control
     E_ctrl = zeros(Float64, G, k_valid)
     
     for (j, ctrl) in enumerate(valid_ctrl_syms)
         ctrl_vec = Float64.(d[!, ctrl])
         
-        # Build list of other valid controls
         other_ctrl = filter(s -> s != ctrl, valid_ctrl_syms)
         
-        # Residualize this control on other controls + FE (among donors)
         if isempty(other_ctrl)
             f_resid = Term(ctrl) ~ fe_terms
         else
@@ -736,17 +704,17 @@ function compute_cluster_scores_controls!(
         
         # Map back to full dataset and multiply by wei
         ctrlweight = zeros(Float64, n)
-        resid_idx = 0
         for i in 1:n_donors
-            if esample_resid[i]
-                resid_idx += 1
-                orig_row = d_donors[i, :__orig_row]
-                ctrlweight[orig_row] = ctrlweight_raw[resid_idx] * wei[orig_row]
+            if i <= length(esample_resid) && esample_resid[i] && i <= length(ctrlweight_raw)
+                val = ctrlweight_raw[i]
+                if !ismissing(val)
+                    orig_row = d_donors[i, :__orig_row]
+                    ctrlweight[orig_row] = Float64(val) * wei[orig_row]
+                end
             end
         end
         
-        # Normalize: Stata uses sum(ctrlweight * ctrl) where D==0 & touse
-        # This is sum(ctrlweight_product)
+        # Normalize
         norm_sum = 0.0
         for i in 1:n
             if donor_mask[i]
@@ -760,7 +728,7 @@ function compute_cluster_scores_controls!(
             end
         end
         
-        # Compute cluster scores: sum(ctrlweight * imput_resid) by cluster
+        # Compute cluster scores
         for i in 1:n
             if touse[i]
                 g_idx = cluster_idx_map[cluster_vec[i]]
@@ -768,12 +736,12 @@ function compute_cluster_scores_controls!(
             end
         end
         
-        # Apply DOF adjustment
         E_ctrl[:, j] .*= sqrt(dof_adj_ctrl)
     end
     
     return E_ctrl, β_ctrl, valid_ctrl_syms
 end
+
 
 
 """
@@ -852,7 +820,6 @@ function fit_bjs(df::DataFrame;
     maxiter::Int = 1000,
     autosample::Bool = true
     )
-    # Default avgeffectsby to (cohort, time)
     if avgeffectsby === nothing
         avgeffectsby = [g, t]
     end
@@ -916,11 +883,9 @@ function fit_bjs(df::DataFrame;
                                              autosample=autosample, verbose=true)
     
     if n_dropped > 0
-        # Filter the dataset
         d = d[keep_mask, :]
         n = nrow(d)
         
-        # Update all relevant variables
         wei = isnothing(weights) ? ones(Float64, n) : Float64.(d[!, weights])
         D = d[!, :D]
         K = d[!, :K]
@@ -931,9 +896,6 @@ function fit_bjs(df::DataFrame;
     end
     
     # Save first-stage imputation residual (needed for control SEs)
-    # Note: m1 was fit on original donor sample, but we may have filtered d
-    # The autosample only drops TREATED observations, so donors are unchanged
-    # Therefore we can safely map residuals from m1 to the current d
     
     imput_resid_raw = residuals(m1)
     esample_m1 = m1.esample
@@ -941,13 +903,13 @@ function fit_bjs(df::DataFrame;
     
     # Map residuals: donors in current d should match donors in original fit
     donor_indices = findall(donors)
-    resid_idx = 0
     for (i, donor_i) in enumerate(donor_indices)
-        if i <= length(esample_m1) && esample_m1[i]
-            resid_idx += 1
-            if resid_idx <= length(imput_resid_raw)
-                imput_resid[donor_i] = imput_resid_raw[resid_idx]
+        if i <= length(esample_m1) && i <= length(imput_resid_raw) && esample_m1[i]
+            val = imput_resid_raw[i]  
+            if !ismissing(val)
+                imput_resid[donor_i] = Float64(val)
             end
+            # If missing, imput_resid[donor_i] stays 0.0 (already initialized)
         end
     end
     
@@ -958,7 +920,6 @@ function fit_bjs(df::DataFrame;
     eff = Float64.(d[!, y]) .- Float64.(coalesce.(y0hat, 0.0))
     d[!, :effect] = eff
     
-    # Handle any remaining missing Y0 (should be rare after autosample)
     keep = .!ismissing.(y0hat)
     if any(.!keep)
         d = d[keep, :]
@@ -973,7 +934,6 @@ function fit_bjs(df::DataFrame;
         eff = d[!, :effect]
     end
     
-    # Store imput_resid in dataframe for later use
     d[!, :__imput_resid] = imput_resid
     
     #=== 5. Construct wtr weights for tau ===#
@@ -1048,7 +1008,7 @@ function fit_bjs(df::DataFrame;
     
     #=== 8. Compute influence weights for tau ===#
     fe_syms = Symbol[fe...]
-    W_tau, iters = compute_influence_weights_fixed!(
+    W_tau, iters = compute_influence_weights!(
         d, wtr_syms, controls, fe_syms, :D, weights;
         touse_sym = :__touse,
         tol = tol,
