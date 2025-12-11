@@ -4,14 +4,12 @@ using StagDiDModels
 using Distributions: Normal, quantile
 using Makie
 using StatsAPI
-
+using Base.Threads
 # Import types we need to dispatch on
 import StagDiDModels: BJSModel, GardnerModel, SunabModel, TWFEModel, 
                       cumulative_effects, fit_bjs_dynamic, fit_gardner_dynamic, 
-                      fit_sunab, fit_twfe_dynamic
+                      fit_sunab, fit_twfe_dynamic, plot_event_study, plot_cumulative, plot_comparison
 
-# Export plotting functions
-export plot_event_study, plot_cumulative, plot_comparison
 
 #=============================================================================
     Color Palette and Styling
@@ -99,7 +97,7 @@ fig = plot_event_study(m; title="BJS Event Study", color=:steelblue)
 save("event_study.png", fig)
 ```
 """
-function plot_event_study(m::StatsAPI.StatisticalModel;
+function StagDiDModels.plot_event_study(m::StatsAPI.StatisticalModel;
                           level::Float64 = 0.95,
                           title::String = "Event Study",
                           xlabel::String = "Event Time (τ)",
@@ -191,12 +189,12 @@ cum = cumulative_effects(m)
 fig = plot_cumulative(cum)
 ```
 """
-function plot_cumulative(m::StatsAPI.StatisticalModel; kwargs...)
+function StagDiDModels.plot_cumulative(m::StatsAPI.StatisticalModel; kwargs...)
     cum = cumulative_effects(m)
     return plot_cumulative(cum; kwargs...)
 end
 
-function plot_cumulative(cum::NamedTuple;
+function StagDiDModels.plot_cumulative(cum::NamedTuple;
                          title::String = "Cumulative Effects",
                          xlabel::String = "Event Time (τ)",
                          ylabel::String = "Cumulative Treatment Effect",
@@ -287,7 +285,7 @@ save("comparison.png", result.figure)
 coef(result.models[:bjs])
 ```
 """
-function plot_comparison(df;
+function StagDiDModels.plot_comparison(df;
                          y::Symbol,
                          id::Symbol,
                          t::Symbol,

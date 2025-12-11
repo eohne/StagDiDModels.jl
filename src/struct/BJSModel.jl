@@ -1,7 +1,7 @@
 """
     BJSModel <: RegressionModel
 
-Borusyak, Jaravel, and Spiess (2021) imputation estimator results.
+Borusyak, Jaravel, and Spiess (2023) imputation estimator results.
 
 """
 struct BJSModel <: RegressionModel

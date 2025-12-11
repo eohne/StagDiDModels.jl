@@ -803,7 +803,7 @@ its analytic influence-function variance estimation.
 - Time variable must be integer-coded
 - When `autosample=true`, observations where FE cannot be imputed are dropped with a warning.
 """
-function fit_bjs(df::DataFrame;
+function fit_bjs_st(df::DataFrame;
     y::Symbol,
     id::Symbol,
     t::Symbol,
@@ -1109,9 +1109,108 @@ end
 
 
 """
+    fit_bjs(df::DataFrame;
+        y::Symbol,
+        id::Symbol,
+        t::Symbol,
+        g::Symbol,
+        controls::Vector{Symbol} = Symbol[],
+        fe::Tuple = (id, t),
+        weights::Union{Nothing,Symbol} = nothing,
+        cluster::Union{Nothing,Symbol} = nothing,
+        horizons::Union{Nothing,Bool,Vector{Int}} = nothing,
+        pretrends::Union{Nothing,Bool,Int,Vector{Int}} = nothing,
+        avgeffectsby::Union{Nothing,Vector{Symbol}} = nothing,
+        control_type::Symbol = :notyet,
+        tol::Float64 = 1e-6,
+        maxiter::Int = 1000,
+        autosample::Bool = true,
+        multithreaded::Bool = true)
+
+Estimate treatment effects using the Borusyak, Jaravel, and Spiess (2023) 
+imputation estimator for staggered adoption designs. This implementation 
+follows the logic of the official Stata `did_imputation` command, including 
+its analytic influence-function variance estimation.
+
+# Arguments
+- `df::DataFrame`: Long panel dataset in (i,t) format.
+- `y::Symbol`: Outcome variable.
+- `id::Symbol`: Unit (e.g. firm, fund) identifier.
+- `t::Symbol`: Time period identifier (integer-coded).
+- `g::Symbol`: First treatment period for each unit. Missing/0 values indicate never-treated units.
+
+# Keyword Arguments
+- `controls::Vector{Symbol}`: Time-varying covariates included in the imputation regression.
+- `fe::Tuple = (id, t)`: Absorbed fixed effects. Default is unit + time FE.
+- `weights::Union{Nothing,Symbol}`: Optional observation weights.
+- `cluster::Union{Nothing,Symbol}`: Clustering variable for standard errors.
+- `horizons::Union{Nothing,Bool,Vector{Int}}`: Controls dynamic vs. static estimation:
+    - `nothing` → static ATT (single coefficient)
+    - `true` → estimate all post-treatment horizons (τ ≥ 0)  
+    - `Vector{Int}` → estimate only selected horizons (e.g., `[0,1,2,3,4,5]`)
+- `pretrends::Union{Nothing,Bool,Int,Vector{Int}}`: Pre-trend coefficients:
+    - `nothing` or `false` → no pre-trend terms  
+    - `true` → all negative horizons (τ < 0)
+    - `Int` → number of pre-periods (e.g., `5` means K=-1 to K=-5)
+    - `Vector{Int}` → specific pre-horizons
+- `avgeffectsby`: Grouping variables for averaging treatment effects. Default is `[g, t]` (cohort x time), matching Stata's default behavior.
+- `control_type::Symbol = :notyet`: Donor pool definition.
+- `tol::Float64 = 1e-6`: Convergence tolerance for influence weight iteration.
+- `maxiter::Int = 1000`: Maximum iterations for influence weight computation.
+- `autosample::Bool = true`: If true (default), drop treated observations where FE cannot 
+                             be imputed from donor sample. If false, error.
+- `multithreaded::Bool = true`: whether to multithread or not.
+
+# Returns
+`BJSModel` object.
+
+# Notes
+- Never-treated units: code as `missing` or `0` in `g`
+- Time variable must be integer-coded
+- When `autosample=true`, observations where FE cannot be imputed are dropped with a warning.
+"""
+function fit_bjs(df::DataFrame;
+    y::Symbol,
+    id::Symbol,
+    t::Symbol,
+    g::Symbol,
+    controls::Vector{Symbol} = Symbol[],
+    fe::Tuple = (id, t),
+    weights::Union{Nothing,Symbol} = nothing,
+    cluster::Union{Nothing,Symbol} = nothing,
+    horizons::Union{Nothing,Bool,Vector{Int}} = nothing,
+    pretrends::Union{Nothing,Bool,Int,Vector{Int}} = nothing,
+    avgeffectsby::Union{Nothing,Vector{Symbol}} = nothing,
+    control_type::Symbol = :notyet,
+    tol::Float64 = 1e-6,
+    maxiter::Int = 1000,
+    autosample::Bool = true,
+    multithreaded::Bool = true
+    )
+    
+    if multithreaded
+        return fit_bjs_mt(df; 
+            y=y, id=id, t=t, g=g,
+            controls=controls, fe=fe, weights=weights,
+            cluster=cluster, horizons=horizons, pretrends=pretrends,
+            avgeffectsby=avgeffectsby, control_type=control_type,
+            tol=tol, maxiter=maxiter, autosample=autosample
+        )
+    else
+        return fit_bjs_st(df;
+            y=y, id=id, t=t, g=g,
+            controls=controls, fe=fe, weights=weights,
+            cluster=cluster, horizons=horizons, pretrends=pretrends,
+            avgeffectsby=avgeffectsby, control_type=control_type,
+            tol=tol, maxiter=maxiter, autosample=autosample
+        )
+    end
+end
+
+"""
     fit_bjs_static(df::DataFrame; y, id, t, g, controls=Symbol[], fe=(id,t),
                    weights=nothing, cluster=nothing, control_type=:notyet,
-                   tol=1e-6, maxiter=1000, autosample=true)
+                   tol=1e-6, maxiter=1000, autosample=true, multithreaded=true)
 
 Static ATT estimator using Borusyak, Jaravel, and Spiess (2023) imputation.
 Wrapper for `fit_bjs(...; horizons=nothing, pretrends=nothing)`.
@@ -1128,13 +1227,15 @@ function fit_bjs_static(df::DataFrame;
     control_type::Symbol = :notyet,
     tol::Float64 = 1e-6,
     maxiter::Int = 1000,
-    autosample::Bool = true)
+    autosample::Bool = true,
+    multithreaded::Bool = true)
     
     return fit_bjs(df; y=y, id=id, t=t, g=g,
                    controls=controls, fe=fe, weights=weights,
                    cluster=cluster, horizons=nothing, pretrends=nothing,
                    control_type=control_type, tol=tol, maxiter=maxiter,
-                   autosample=autosample)
+                   autosample=autosample,
+                   multithreaded = multithreaded)
 end
 
 
@@ -1142,7 +1243,7 @@ end
     fit_bjs_dynamic(df::DataFrame; y, id, t, g, controls=Symbol[], fe=(id,t),
                     weights=nothing, cluster=nothing, horizons=true,
                     pretrends=true, avgeffectsby=nothing,
-                    control_type=:notyet, tol=1e-6, maxiter=1000, autosample=true)
+                    control_type=:notyet, tol=1e-6, maxiter=1000, autosample=true, multithreaded=true)
 
 Dynamic event-study estimator using Borusyak, Jaravel, and Spiess (2023) imputation.
 Wrapper for `fit_bjs` with `horizons=true` and `pretrends=true` by default.
@@ -1162,11 +1263,13 @@ function fit_bjs_dynamic(df::DataFrame;
     control_type::Symbol = :notyet,
     tol::Float64 = 1e-6,
     maxiter::Int = 1000,
-    autosample::Bool = true)
+    autosample::Bool = true,
+    multithreaded::Bool = true)
     
     return fit_bjs(df; y=y, id=id, t=t, g=g,
                    controls=controls, fe=fe, weights=weights,
                    cluster=cluster, horizons=horizons, pretrends=pretrends,
                    avgeffectsby=avgeffectsby, control_type=control_type,
-                   tol=tol, maxiter=maxiter, autosample=autosample)
+                   tol=tol, maxiter=maxiter, autosample=autosample,
+                   multithreaded = multithreaded)
 end
