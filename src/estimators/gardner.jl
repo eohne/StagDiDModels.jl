@@ -2,7 +2,8 @@
     fit_gardner_static(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
                      controls::Vector{Symbol}=Symbol[], cluster::Symbol,
                      weights::Union{Nothing,Symbol}=nothing, control_type::Symbol=:notyet,
-                     autosample::Bool=true)
+                     autosample::Bool=true,
+                     verbose::Bool = false)
 
 Gardner (2021) two-stage difference-in-differences estimator for static treatment effects.
 
@@ -25,6 +26,7 @@ Estimates Y(0) using donor observations, then regresses residualized outcome on 
 - `control_type::Symbol`: `:notyet` (not-yet + never treated) or `:never` (never treated only)
 - `autosample::Bool`: If true (default), drop treated observations where FE cannot be imputed.
                       If false, error when FE cannot be imputed.
+- `verbose::Bool = false`: If drop number of treated observations (autosample) and dropped colinear vars and pretrends should be printed.
 
 # Returns
 
@@ -46,7 +48,8 @@ function fit_gardner_static(df::DataFrame;
                           cluster::Symbol=id,
                           weights::Union{Nothing,Symbol}=nothing,
                           control_type::Symbol=:notyet,
-                          autosample::Bool=true)
+                          autosample::Bool=true,
+                          verbose=false)
 
     d = copy(df)
     
@@ -75,10 +78,15 @@ function fit_gardner_static(df::DataFrame;
     
     # Estimate first stage on untreated observations only
     untreated_data = d[untreated_mask, :]
-    
-    m1 = reg(untreated_data, f1, Vcov.robust(); 
-             weights = weights,
-             save = :fe)
+    if verbose
+        m1 = reg(untreated_data, f1, Vcov.robust(); 
+                weights = weights,
+                save = :fe)
+    else
+        m1 = quiet_reg(untreated_data, f1, Vcov.robust();
+                weights=weights,
+                save = :fe)
+    end
     
     # Extract first stage R²
     first_stage_r2 = try
@@ -90,7 +98,7 @@ function fit_gardner_static(df::DataFrame;
     # === AUTOSAMPLE: Check which treated observations can be imputed ===
     treated_mask = BitVector(d[!, :_ATT] .== 1)
     keep_mask, n_dropped = apply_autosample(d, m1, treated_mask; 
-                                             autosample=autosample, verbose=true)
+                                             autosample=autosample, verbose=verbose)
     
     if n_dropped > 0
         # Filter the dataset
@@ -123,7 +131,11 @@ function fit_gardner_static(df::DataFrame;
     # Stage 2: Regress residualized outcome on computed treatment indicator
     f2 = Term(:ytilde) ~ term(0) + term(:_ATT)
     
-    m2 = reg(d, f2, Vcov.robust(); weights = weights)
+    if verbose
+        m2 = reg(d, f2, Vcov.robust(); weights = weights)
+    else
+        m2 = quiet_reg(d, f2, Vcov.robust(); weights=weights)
+    end
     
     # --- Standard Error Correction ---
     
@@ -318,9 +330,15 @@ function fit_gardner_dynamic(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g:
     untreated_data = d[untreated_mask, :]
 
     # Fit first stage
-    m1 = reg(untreated_data, f1, Vcov.robust();
-             weights = weights,
-             save = :fe)
+    if verbose
+        m1 = reg(untreated_data, f1, Vcov.robust();
+                weights = weights,
+                save = :fe)
+    else
+        m1 = quiet_reg(untreated_data, f1, Vcov.robust();
+                weights=weights,
+                save = :fe)
+    end
 
     # Extract first stage R²
     first_stage_r2 = try
@@ -379,7 +397,11 @@ function fit_gardner_dynamic(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g:
     f2 = Term(:ytilde) ~ rhs
     
     # Fit second stage regression
-    m2 = reg(d, f2, Vcov.robust(); weights = weights)
+    if verbose
+        m2 = reg(d, f2, Vcov.robust(); weights = weights)
+    else
+        m2 = quiet_reg(d, f2, Vcov.robust(); weights=weights)
+    end
     
     
     # Apply influence function correction (same logic as static case)

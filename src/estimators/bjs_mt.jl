@@ -17,7 +17,8 @@ function compute_cluster_scores_pretrends_mt!(
     cluster::Union{Nothing,Symbol},
     weights::Union{Nothing,Symbol};
     y::Symbol,
-    touse_sym::Symbol = :__touse
+    touse_sym::Symbol = :__touse,
+    verbose::Bool=false
     )
     n = nrow(d)
     k_pre = length(pre_syms)
@@ -122,7 +123,7 @@ function compute_cluster_scores_pretrends_mt!(
     end
     
     omitted_pre = setdiff(pre_syms, valid_pre_syms)
-    if !isempty(omitted_pre)
+    if !isempty(omitted_pre) && verbose
         @warn "Collinear pre-trends omitted: $(join(omitted_pre, ", "))"
     end
     k_valid = length(valid_pre_syms)
@@ -238,7 +239,8 @@ function compute_cluster_scores_controls_mt!(
     weights::Union{Nothing,Symbol},
     imput_resid::Vector{Float64};
     y::Symbol,
-    touse_sym::Symbol = :__touse
+    touse_sym::Symbol = :__touse,
+    verbose::Bool=false
     )
     n = nrow(d)
     k_ctrl = length(controls)
@@ -335,7 +337,7 @@ function compute_cluster_scores_controls_mt!(
     end
     
     omitted_ctrls = setdiff(controls, valid_ctrl_syms)
-    if !isempty(omitted_ctrls)
+    if !isempty(omitted_ctrls)  && verbose
         @warn "Collinear controls omitted: $(join(omitted_ctrls, ", "))"
     end
     k_valid = length(valid_ctrl_syms)
@@ -425,7 +427,8 @@ function fit_bjs_mt(df::DataFrame;
     control_type::Symbol = :notyet,
     tol::Float64 = 1e-6,
     maxiter::Int = 1000,
-    autosample::Bool = true
+    autosample::Bool = true,
+    verbose::Bool = false
     )
     if avgeffectsby === nothing
         avgeffectsby = [g, t]
@@ -487,7 +490,7 @@ function fit_bjs_mt(df::DataFrame;
     #=== AUTOSAMPLE: Check which treated observations can be imputed ===#
     treated_mask = BitVector(D .== 1)
     keep_mask, n_dropped = apply_autosample(d, m1, treated_mask; 
-                                             autosample=autosample, verbose=true)
+                                             autosample=autosample, verbose=verbose)
     
     if n_dropped > 0
         d = d[keep_mask, :]
@@ -620,6 +623,7 @@ function fit_bjs_mt(df::DataFrame;
         touse_sym = :__touse,
         tol = tol,
         maxiter = maxiter,
+        verbose=verbose
     )
     
     #=== 9. Setup cluster structure ===#
@@ -638,7 +642,8 @@ function fit_bjs_mt(df::DataFrame;
     E_pre, β_pre, valid_pre_idx = compute_cluster_scores_pretrends_mt!(
         d, pre_syms, controls, fe, wei, cluster_vec, cluster_ids, cluster, weights;
         y = y,
-        touse_sym = :__touse
+        touse_sym = :__touse,
+        verbose=verbose
     )
     k_pre = length(β_pre)
     
@@ -647,7 +652,8 @@ function fit_bjs_mt(df::DataFrame;
         d, controls, fe, wei, cluster_vec, cluster_ids, cluster, weights, 
         d[!, :__imput_resid];
         y = y,
-        touse_sym = :__touse
+        touse_sym = :__touse,
+        verbose=verbose
     )
     k_ctrl = length(β_ctrl)
     
@@ -873,6 +879,7 @@ function compute_influence_weights_mt!(
     touse_sym::Union{Nothing,Symbol}=nothing,
     tol::Float64=1e-6,
     maxiter::Int=1000,
+    verbose::Bool=false
     )
     n = nrow(df)
     k = length(wtr_syms)

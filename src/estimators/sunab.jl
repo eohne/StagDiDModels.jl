@@ -5,7 +5,8 @@
               weights::Union{Nothing,Symbol} = nothing,
               ref_p::Int = -1,
               ref_c::Union{Symbol,Vector{Int}} = :never,
-              agg::Symbol = :dynamic)
+              agg::Symbol = :dynamic,
+              verbose::Bool = false)
 
 Sun-Abraham
 
@@ -34,6 +35,7 @@ Sun-Abraham
 - `ref_p`: pre-period base τ (default `-1`), excluded from estimation.
 - `ref_c`: reference cohort (`:never` = never-treated; or `Vector{Int}` for specific cohorts).
 - `agg`: `:dynamic` (per-τ effects), `:att` (static ATT), or `:both`.
+- `verbose::Bool = false`: If warnings should be printed (e.g. dropped colinear vars/pretrends).
 
 # Returns
 - If `agg=:dynamic`: `SunabModel` with coefficients `"τ::<τ>"`.
@@ -69,7 +71,8 @@ function fit_sunab(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
                    weights::Union{Nothing,Symbol}=nothing,
                    ref_p::Int=-1,
                    ref_c::Union{Symbol,Vector{Int}}=:never,
-                   agg::Symbol=:dynamic)
+                   agg::Symbol=:dynamic,
+                   verbose::Bool = false)
 
     d = copy(df)
     
@@ -161,8 +164,11 @@ function fit_sunab(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Symbol,
     
     # Fit saturated regression
     vc = build_cluster_vcov(cluster)
-    
-    sat = reg(d, f, vc; weights=weights)
+    if verbose
+        sat = reg(d, f, vc; weights=weights)
+    else
+        sat = quiet_reg(d, f, vc; weights = weights)
+    end
     
     # Extract coefficients for cohort x period interactions
     coef_names = StatsAPI.coefnames(sat)

@@ -1,8 +1,3 @@
-function quiet_reg(args...; kwargs...)
-    with_logger(SimpleLogger(stderr, Logging.Warn)) do
-        reg(args...; kwargs...)
-    end
-end
 """
     update_weights_control!(W, x; donors, touse, wei)
 
@@ -128,6 +123,7 @@ function compute_influence_weights!(
     touse_sym::Union{Nothing,Symbol}=nothing,
     tol::Float64=1e-6,
     maxiter::Int=1000,
+    verbose::Bool = true
     )
     n = nrow(df)
     k = length(wtr_syms)
@@ -367,7 +363,8 @@ function compute_cluster_scores_pretrends!(
     cluster::Union{Nothing,Symbol},
     weights::Union{Nothing,Symbol};
     y::Symbol,
-    touse_sym::Symbol = :__touse
+    touse_sym::Symbol = :__touse,
+    verbose::Bool = false
     )
     n = nrow(d)
     k_pre = length(pre_syms)
@@ -472,7 +469,7 @@ function compute_cluster_scores_pretrends!(
     end
     
     omitted_pre = setdiff(pre_syms, valid_pre_syms)
-    if !isempty(omitted_pre)
+    if !isempty(omitted_pre) && verbose 
         @warn "Collinear pre-trends omitted: $(join(omitted_pre, ", "))"
     end
     k_valid = length(valid_pre_syms)
@@ -580,7 +577,8 @@ function compute_cluster_scores_controls!(
     weights::Union{Nothing,Symbol},
     imput_resid::Vector{Float64};
     y::Symbol,
-    touse_sym::Symbol = :__touse
+    touse_sym::Symbol = :__touse,
+    verbose::Bool = false
     )
     n = nrow(d)
     k_ctrl = length(controls)
@@ -677,7 +675,7 @@ function compute_cluster_scores_controls!(
     end
     
     omitted_ctrls = setdiff(controls, valid_ctrl_syms)
-    if !isempty(omitted_ctrls)
+    if !isempty(omitted_ctrls) && verbose
         @warn "Collinear controls omitted: $(join(omitted_ctrls, ", "))"
     end
     k_valid = length(valid_ctrl_syms)
@@ -745,7 +743,7 @@ end
 
 
 """
-    fit_bjs(df::DataFrame;
+    fit_bjs_st(df::DataFrame;
         y::Symbol,
         id::Symbol,
         t::Symbol,
@@ -760,7 +758,8 @@ end
         control_type::Symbol = :notyet,
         tol::Float64 = 1e-6,
         maxiter::Int = 1000,
-        autosample::Bool = true)
+        autosample::Bool = true,
+        verbose::Bool = false)
 
 Estimate treatment effects using the Borusyak, Jaravel, and Spiess (2023) 
 imputation estimator for staggered adoption designs. This implementation 
@@ -794,6 +793,7 @@ its analytic influence-function variance estimation.
 - `maxiter::Int = 1000`: Maximum iterations for influence weight computation.
 - `autosample::Bool = true`: If true (default), drop treated observations where FE cannot 
                              be imputed from donor sample. If false, error.
+- `verbose::Bool = false`: If warnings should be printed. (e.g. dropping of singletons, collinear pretrends or controls)
 
 # Returns
 `BJSModel` object.
@@ -818,7 +818,8 @@ function fit_bjs_st(df::DataFrame;
     control_type::Symbol = :notyet,
     tol::Float64 = 1e-6,
     maxiter::Int = 1000,
-    autosample::Bool = true
+    autosample::Bool = true,
+    verbose::Bool=false
     )
     if avgeffectsby === nothing
         avgeffectsby = [g, t]
@@ -880,7 +881,7 @@ function fit_bjs_st(df::DataFrame;
     #=== AUTOSAMPLE: Check which treated observations can be imputed ===#
     treated_mask = BitVector(D .== 1)
     keep_mask, n_dropped = apply_autosample(d, m1, treated_mask; 
-                                             autosample=autosample, verbose=true)
+                                             autosample=autosample, verbose=verbose)
     
     if n_dropped > 0
         d = d[keep_mask, :]
@@ -1013,6 +1014,7 @@ function fit_bjs_st(df::DataFrame;
         touse_sym = :__touse,
         tol = tol,
         maxiter = maxiter,
+        verbose=verbose
     )
     
     #=== 9. Setup cluster structure ===#
@@ -1031,7 +1033,8 @@ function fit_bjs_st(df::DataFrame;
     E_pre, β_pre, valid_pre_idx = compute_cluster_scores_pretrends!(
         d, pre_syms, controls, fe, wei, cluster_vec, cluster_ids, cluster, weights;
         y = y,
-        touse_sym = :__touse
+        touse_sym = :__touse,
+        verbose = verbose
     )
     k_pre = length(β_pre)
     
@@ -1040,7 +1043,8 @@ function fit_bjs_st(df::DataFrame;
         d, controls, fe, wei, cluster_vec, cluster_ids, cluster, weights, 
         d[!, :__imput_resid];
         y = y,
-        touse_sym = :__touse
+        touse_sym = :__touse,
+        verbose=verbose
     )
     k_ctrl = length(β_ctrl)
     
@@ -1159,6 +1163,7 @@ its analytic influence-function variance estimation.
 - `maxiter::Int = 1000`: Maximum iterations for influence weight computation.
 - `autosample::Bool = true`: If true (default), drop treated observations where FE cannot 
                              be imputed from donor sample. If false, error.
+- `verbose::Bool = false`: If warnings should be printed. (e.g. dropping of singletons, collinear pretrends or controls)
 - `multithreaded::Bool = true`: whether to multithread or not.
 
 # Returns
@@ -1185,6 +1190,7 @@ function fit_bjs(df::DataFrame;
     tol::Float64 = 1e-6,
     maxiter::Int = 1000,
     autosample::Bool = true,
+    verbose::Bool = false,
     multithreaded::Bool = true
     )
     
@@ -1194,7 +1200,7 @@ function fit_bjs(df::DataFrame;
             controls=controls, fe=fe, weights=weights,
             cluster=cluster, horizons=horizons, pretrends=pretrends,
             avgeffectsby=avgeffectsby, control_type=control_type,
-            tol=tol, maxiter=maxiter, autosample=autosample
+            tol=tol, maxiter=maxiter, autosample=autosample,verbose=verbose
         )
     else
         return fit_bjs_st(df;
@@ -1202,7 +1208,7 @@ function fit_bjs(df::DataFrame;
             controls=controls, fe=fe, weights=weights,
             cluster=cluster, horizons=horizons, pretrends=pretrends,
             avgeffectsby=avgeffectsby, control_type=control_type,
-            tol=tol, maxiter=maxiter, autosample=autosample
+            tol=tol, maxiter=maxiter, autosample=autosample,verbose=verbose
         )
     end
 end
@@ -1210,7 +1216,7 @@ end
 """
     fit_bjs_static(df::DataFrame; y, id, t, g, controls=Symbol[], fe=(id,t),
                    weights=nothing, cluster=nothing, control_type=:notyet,
-                   tol=1e-6, maxiter=1000, autosample=true, multithreaded=true)
+                   tol=1e-6, maxiter=1000, autosample=true, verbose=false, multithreaded=true)
 
 Static ATT estimator using Borusyak, Jaravel, and Spiess (2023) imputation.
 Wrapper for `fit_bjs(...; horizons=nothing, pretrends=nothing)`.
@@ -1228,13 +1234,15 @@ function fit_bjs_static(df::DataFrame;
     tol::Float64 = 1e-6,
     maxiter::Int = 1000,
     autosample::Bool = true,
-    multithreaded::Bool = true)
+    verbose::Bool = false,
+    multithreaded::Bool = true
+    )
     
     return fit_bjs(df; y=y, id=id, t=t, g=g,
                    controls=controls, fe=fe, weights=weights,
                    cluster=cluster, horizons=nothing, pretrends=nothing,
                    control_type=control_type, tol=tol, maxiter=maxiter,
-                   autosample=autosample,
+                   autosample=autosample,verbose=verbose,
                    multithreaded = multithreaded)
 end
 
@@ -1243,7 +1251,7 @@ end
     fit_bjs_dynamic(df::DataFrame; y, id, t, g, controls=Symbol[], fe=(id,t),
                     weights=nothing, cluster=nothing, horizons=true,
                     pretrends=true, avgeffectsby=nothing,
-                    control_type=:notyet, tol=1e-6, maxiter=1000, autosample=true, multithreaded=true)
+                    control_type=:notyet, tol=1e-6, maxiter=1000, autosample=true,verbose=false, multithreaded=true)
 
 Dynamic event-study estimator using Borusyak, Jaravel, and Spiess (2023) imputation.
 Wrapper for `fit_bjs` with `horizons=true` and `pretrends=true` by default.
@@ -1264,12 +1272,13 @@ function fit_bjs_dynamic(df::DataFrame;
     tol::Float64 = 1e-6,
     maxiter::Int = 1000,
     autosample::Bool = true,
+    verbose::Bool = false,
     multithreaded::Bool = true)
     
     return fit_bjs(df; y=y, id=id, t=t, g=g,
                    controls=controls, fe=fe, weights=weights,
                    cluster=cluster, horizons=horizons, pretrends=pretrends,
                    avgeffectsby=avgeffectsby, control_type=control_type,
-                   tol=tol, maxiter=maxiter, autosample=autosample,
+                   tol=tol, maxiter=maxiter, autosample=autosample,verbose=verbose,
                    multithreaded = multithreaded)
 end

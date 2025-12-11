@@ -29,6 +29,7 @@ export TWFEModel, BJSModel, SunabModel, GardnerModel
 export responsename, coef, vcov, coefnames, nobs, dof_resiudual, dof, stderror, pvalue, confint,r2, islinear, adjr2, coeftable,show
 
 # utils
+include("utils/quiet_reg.jl")
 include("utils/preprocess.jl")
 include("utils/build_vcov.jl")
 include("utils/fe_predict.jl")
