@@ -278,6 +278,7 @@ Event time τ = t - g, with coefficients for each τ ≠ ref_p.
 - `weights::Union{Nothing,Symbol}`: Observation weights  
 - `control_type::Symbol`: `:notyet` (not-yet + never treated) or `:never` (never treated only)
 - `autosample::Bool`: If true (default), drop treated observations where FE cannot be imputed.
+- `verbose::Bool = false`: If drop number of treated observations (autosample) and dropped colinear vars and pretrends should be printed.
 
 # Returns
 
@@ -296,7 +297,7 @@ function fit_gardner_dynamic(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g:
                            ref_p::Int=-1,
                            weights::Union{Nothing,Symbol}=nothing,
                            control_type::Symbol=:notyet,
-                           autosample::Bool=true)
+                           autosample::Bool=true,verbose=false)
 
     d = copy(df)
     
