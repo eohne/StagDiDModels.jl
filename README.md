@@ -1,10 +1,13 @@
 # StagDiDModels.jl
 
+[![CI](https://github.com/eohne/StagDiDModels.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/eohne/StagDiDModels.jl/actions/workflows/CI.yml)
+[![codecov](https://codecov.io/gh/eohne/StagDiDModels.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/eohne/StagDiDModels.jl)
+
 (Some) modern staggered difference-in-differences estimators for Julia.
 
 ## Overview
 
-StagDiDModels.jl implements some of the recent advances in difference-in-differences estimation that address heterogeneous treatment effects in staggered treatment adoption. All estimators provide standard errors, model diagnostics, and are compatible with the StatsAPI ecosystem.
+StagDiDModels.jl implements some of the recent advances in difference-in-differences estimation that address heterogeneous treatment effects in staggered treatment adoption. All estimators provide standard errors, model diagnostics, and are compatible with the StatsAPI ecosystem. Integrates nicely with [HonestDiD.jl](https://github.com/eohne/HonestDiD.jl)
 
 ## Available Estimators
 

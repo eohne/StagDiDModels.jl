@@ -1,4 +1,6 @@
 *.csv
+# Test data must be tracked so CI can run the test suite
+!data/homicide.csv
 ToDo
 .vscode
 Manifest.toml
