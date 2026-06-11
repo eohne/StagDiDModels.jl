@@ -3,6 +3,7 @@ module StagDiDModels
 using Logging # Turns of the printing of FixedEffectModels.jl 
 using DataFrames
 using StatsAPI
+using StatsAPI: pvalue, dof_residual
 using StatsModels
 # using StatsModels: cols
 using FixedEffectModels
@@ -26,7 +27,7 @@ include("struct/GardnerModel.jl")
 include("struct/Sunab.jl")
 export TWFEModel, BJSModel, SunabModel, GardnerModel
 # reexport:
-export responsename, coef, vcov, coefnames, nobs, dof_resiudual, dof, stderror, pvalue, confint,r2, islinear, adjr2, coeftable,show
+export responsename, coef, vcov, coefnames, nobs, dof_residual, dof, stderror, pvalue, confint,r2, islinear, adjr2, coeftable,show
 
 # utils
 include("utils/quiet_reg.jl")

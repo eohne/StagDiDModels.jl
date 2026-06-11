@@ -1,9 +1,16 @@
 *.csv
 # Test data must be tracked so CI can run the test suite
 !data/homicide.csv
+# Coverage artifacts from `Pkg.test(coverage=true)`
+*.cov
+*.jl.cov
+*.jl.*.cov
+lcov.info
 ToDo
 .vscode
 Manifest.toml
 stata
 src/utils/aggregation.jl
 src/utils/preprocess old.jl
+src/estimators/bjs_R.jl
+src/estimators/bjs_R_old.jl
