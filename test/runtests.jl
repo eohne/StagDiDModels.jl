@@ -156,6 +156,38 @@ end
             exercise_api(m)
         end
 
+        @testset "with controls (covariate SE path)" begin
+            # Exercises the control-coefficient influence/SE path and the
+            # pretrend-with-controls branches, on both threading backends.
+            for mt in (true, false)
+                ms = fit_bjs_static(df; y=:dep_var, id=:unit, t=:year, g=:g,
+                                    controls=[:x1], cluster=:unit, multithreaded=mt)
+                exercise_api(ms)
+                @test "x1" in coefnames(ms)
+
+                md = fit_bjs_dynamic(df; y=:dep_var, id=:unit, t=:year, g=:g,
+                                     controls=[:x1], cluster=:unit, multithreaded=mt)
+                exercise_api(md)
+                @test "x1" in coefnames(md)
+                mt && exercise_dynamic_post(md)
+            end
+        end
+
+        @testset "multiple controls + integer pretrends" begin
+            # Two controls exercise the multi-covariate residualization branch;
+            # integer pretrends exercises that pre-horizon construction branch.
+            df2 = copy(df)
+            df2.x2 = randn(MersenneTwister(7), nrow(df2))
+            for mt in (true, false)
+                m = fit_bjs(df2; y=:dep_var, id=:unit, t=:year, g=:g,
+                            controls=[:x1, :x2], horizons=[0,1,2], pretrends=3,
+                            cluster=:unit, multithreaded=mt)
+                exercise_api(m)
+                @test "x1" in coefnames(m)
+                @test "x2" in coefnames(m)
+            end
+        end
+
         @testset "project() heterogeneity vs Stata" begin
             # Reference values from Stata did_imputation (StataNow 19) on the
             # bundled stata/bjs_testdata.csv:
