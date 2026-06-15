@@ -178,6 +178,20 @@ fit_bjs(df; y=:dep_var, id=:unit, t=:year, g=:g, hetby=:region, cluster=:unit)
 
 `project` and `hetby` cannot be used together.
 
+##### Standard errors
+
+The standard errors on `project` slopes and `hetby` group effects are not naive
+OLS errors on the imputed effects. They use the same clustered influence function
+variance that the package applies to every other treatment coefficient, and they
+honor the `cluster` argument. So for `project` the slope inference is clustered at
+the level you pass, and you do not need to cluster or bootstrap it by hand. For
+example, with `project(x_regtrend)` on the bundled test data the slope point
+estimate is the same regardless of clustering, but its standard error moves with
+the cluster choice (about 0.028 with no clustering, 0.044 clustered by unit, and
+0.170 clustered by a coarser region), and the unit clustered value matches Stata's
+`did_imputation` to the displayed digits. The usual caveat applies: the errors are
+only as reliable as the number of clusters, so be careful with very few clusters.
+
 #### Suppressing thin coefficients with `minn`
 
 `minn` sets the minimum effective sample size a coefficient needs before it is
