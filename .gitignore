@@ -1,6 +1,7 @@
 *.csv
 # Test data must be tracked so CI can run the test suite
 !data/homicide.csv
+!test/bjs_testdata.csv
 # Coverage artifacts from `Pkg.test(coverage=true)`
 *.cov
 *.jl.cov

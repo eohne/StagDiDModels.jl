@@ -155,6 +155,91 @@ end
             m = fit_bjs_static(df; y=:dep_var, id=:unit, t=:year, g=:g, cluster=:unit)
             exercise_api(m)
         end
+
+        @testset "project() heterogeneity vs Stata" begin
+            # Reference values from Stata did_imputation (StataNow 19) on the
+            # bundled stata/bjs_testdata.csv:
+            #   did_imputation y id time ei, project(x_regtrend [x_idio]) cluster(id)
+            pdf = CSV.read(joinpath(@__DIR__, "bjs_testdata.csv"),
+                           DataFrame; missingstring = ["", "."])
+
+            # P1: static project(X_regtrend)
+            for mt in (true, false)
+                m = fit_bjs(pdf; y=:Y, id=:id, t=:time, g=:Ei,
+                            project=[:X_regtrend], cluster=:id, multithreaded=mt)
+                exercise_api(m)
+                nm = coefnames(m); b = coef(m); se = stderror(m)
+                @test nm == ["τ_cons", "τ_X_regtrend"]
+                @test b[1]  ≈ -15.55686 rtol=1e-4
+                @test se[1] ≈ 1.398945  rtol=1e-4
+                @test b[2]  ≈ 0.579143  rtol=1e-4
+                @test se[2] ≈ 0.0444729 rtol=1e-4
+            end
+
+            # P2: static project(X_regtrend X_idio)
+            m2 = fit_bjs(pdf; y=:Y, id=:id, t=:time, g=:Ei,
+                         project=[:X_regtrend, :X_idio], cluster=:id, multithreaded=false)
+            nm2 = coefnames(m2); b2 = coef(m2); se2 = stderror(m2)
+            @test nm2 == ["τ_cons", "τ_X_regtrend", "τ_X_idio"]
+            @test b2[1] ≈ -15.545127 rtol=1e-4
+            @test b2[2] ≈ 0.57912293 rtol=1e-4
+            @test b2[3] ≈ 0.27319449 rtol=1e-4
+            @test se2[3] ≈ 0.442574  rtol=1e-4
+
+            # P3: per-horizon gradient (τ0..τ4 match Stata; τ5 differs because the
+            # package, unlike Stata's minn rule, does not suppress small-sample horizons)
+            m3 = fit_bjs(pdf; y=:Y, id=:id, t=:time, g=:Ei,
+                         project=[:X_regtrend], horizons=true, cluster=:id, multithreaded=false)
+            nm3 = coefnames(m3); b3 = coef(m3)
+            i0 = findfirst(==("τ0_cons"), nm3)
+            @test b3[i0] ≈ -12.200934 rtol=1e-4
+            @test b3[findfirst(==("τ0_X_regtrend"), nm3)] ≈ 0.51150923 rtol=1e-4
+        end
+
+        @testset "hetby() heterogeneity vs Stata" begin
+            # Stata: did_imputation y id time ei, hetby(region5) cluster(id)
+            pdf = CSV.read(joinpath(@__DIR__, "bjs_testdata.csv"),
+                           DataFrame; missingstring = ["", "."])
+            target = Dict("τ_1" => (-13.446820, 0.854609),
+                          "τ_2" => (-5.4731711, 0.899868),
+                          "τ_3" => ( 1.3214599, 0.851860),
+                          "τ_4" => ( 9.3381006, 0.849024),
+                          "τ_5" => (16.600868,  0.877086))
+            for mt in (true, false)
+                m = fit_bjs(pdf; y=:Y, id=:id, t=:time, g=:Ei,
+                            hetby=:region5, cluster=:id, multithreaded=mt)
+                exercise_api(m)
+                nm = coefnames(m); b = coef(m); se = stderror(m)
+                @test Set(nm) == Set(keys(target))
+                for (k, (tb, tse)) in target
+                    i = findfirst(==(k), nm)
+                    @test b[i]  ≈ tb  rtol=1e-4
+                    @test se[i] ≈ tse rtol=1e-4
+                end
+            end
+
+            # project + hetby may not be combined
+            @test_throws ErrorException fit_bjs(pdf; y=:Y, id=:id, t=:time, g=:Ei,
+                project=[:X_regtrend], hetby=:region5, cluster=:id)
+        end
+
+        @testset "minn effective-sample suppression" begin
+            pdf = CSV.read(joinpath(@__DIR__, "bjs_testdata.csv"),
+                           DataFrame; missingstring = ["", "."])
+            # Default minn=0 keeps every horizon (incl. the thin τ5).
+            m0 = fit_bjs(pdf; y=:Y, id=:id, t=:time, g=:Ei,
+                         project=[:X_regtrend], horizons=true, cluster=:id)
+            @test "τ5_cons" in coefnames(m0)
+            # minn=30 reproduces Stata's suppression of the τ5 group.
+            m30 = fit_bjs(pdf; y=:Y, id=:id, t=:time, g=:Ei,
+                          project=[:X_regtrend], horizons=true, cluster=:id, minn=30)
+            @test !("τ5_cons" in coefnames(m30))
+            @test length(coef(m30)) == length(coef(m0)) - 2
+            # surviving coefficients are unchanged by the suppression
+            i0a = findfirst(==("τ0_cons"), coefnames(m0))
+            i0b = findfirst(==("τ0_cons"), coefnames(m30))
+            @test coef(m0)[i0a] ≈ coef(m30)[i0b] rtol=1e-8
+        end
     end
 
 end

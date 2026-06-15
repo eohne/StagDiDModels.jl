@@ -150,6 +150,47 @@ Cluster:         :unit
 ===============================================
 ```
 
+#### Treatment effect heterogeneity
+
+Sometimes you expect the treatment effect to differ along some dimension. There
+are two ways to look at this, both matching the Stata `did_imputation` options of
+the same name.
+
+Use `project` when the dimension is continuous and you want to know how the effect
+changes with it. It regresses the individual imputed effects on the covariates you
+pass and reports an intercept (`τ_cons`) together with a slope for each covariate
+(`τ_<var>`). A positive, significant slope means the effect is larger when that
+variable is larger. With `horizons` you get one intercept and slope per event time.
+
+```julia
+# Does the effect grow with x1?
+fit_bjs(df; y=:dep_var, id=:unit, t=:year, g=:g, project=[:x1], cluster=:unit)
+```
+
+Use `hetby` when the dimension is discrete (up to 30 groups). It reports a separate
+effect for each group value, named `τ_<value>`, or `τ<h>_<value>` when combined with
+`horizons`.
+
+```julia
+# A separate ATT for each region
+fit_bjs(df; y=:dep_var, id=:unit, t=:year, g=:g, hetby=:region, cluster=:unit)
+```
+
+`project` and `hetby` cannot be used together.
+
+#### Suppressing thin coefficients with `minn`
+
+`minn` sets the minimum effective sample size a coefficient needs before it is
+reported. It defaults to `0`, which keeps every coefficient, so existing code is
+unaffected. Setting `minn=30` reproduces Stata's default behaviour and drops
+coefficients (often long horizons or small heterogeneity cells) that rest on too
+few effective observations, since their standard errors can be misleadingly small.
+Suppressed coefficients are reported in a warning.
+
+```julia
+fit_bjs(df; y=:dep_var, id=:unit, t=:year, g=:g, horizons=true, minn=30, cluster=:unit)
+```
+
 
 ### Gardner Two-Stage DiD
 
@@ -456,6 +497,12 @@ All estimator functions accept:
 - `controls::Vector{Symbol}`: Additional controls (default: `Symbol[]`)
 - `cluster::Symbol`: Clustering variable (default: clusters by `id`)
 - `weights::Union{Nothing,Symbol}`: Observation weights (default: `nothing`)
+
+`fit_bjs` additionally accepts:
+
+- `project::Vector{Symbol}`: Continuous treatment effect heterogeneity, the Stata `project()` option (default: `Symbol[]`)
+- `hetby::Union{Nothing,Symbol}`: Discrete treatment effect heterogeneity, the Stata `hetby()` option (default: `nothing`)
+- `minn::Real`: Minimum effective sample size per coefficient. `0` keeps everything, `30` matches Stata's default (default: `0`)
 
 ## R Package Equivalents
 

@@ -423,6 +423,9 @@ function fit_bjs_mt(df::DataFrame;
     cluster::Union{Nothing,Symbol} = nothing,
     horizons::Union{Nothing,Bool,Vector{Int}} = nothing,
     pretrends::Union{Nothing,Bool,Int,Vector{Int}} = nothing,
+    project::Vector{Symbol} = Symbol[],
+    hetby::Union{Nothing,Symbol} = nothing,
+    minn::Real = 0,
     avgeffectsby::Union{Nothing,Vector{Symbol}} = nothing,
     control_type::Symbol = :notyet,
     tol::Float64 = 1e-6,
@@ -433,12 +436,18 @@ function fit_bjs_mt(df::DataFrame;
     if avgeffectsby === nothing
         avgeffectsby = [g, t]
     end
-    
+    project_mode = !isempty(project)
+    hetby_mode = hetby !== nothing
+    project_mode && hetby_mode &&
+        error("Options project and hetby cannot be combined.")
+
     #=== 0. Copy and clean data ===#
     d = copy(df)
     d[!, g] = replace(d[!, g], 0 => missing)
     key_vars = Symbol[y, id, t]
     append!(key_vars, controls)
+    append!(key_vars, project)
+    hetby_mode && push!(key_vars, hetby)
     if !isnothing(weights); push!(key_vars, weights); end
     if !isnothing(cluster); push!(key_vars, cluster); end
     key_vars = unique(key_vars)
@@ -548,17 +557,39 @@ function fit_bjs_mt(df::DataFrame;
     
     #=== 5. Construct wtr weights for tau ===#
     wtr_syms = Symbol[]
-    if horizons === nothing || horizons === false
+    tau_display = String[]   # display names, parallel to wtr_syms
+    if project_mode || hetby_mode
+        base_specs = Tuple{String,Vector{Bool}}[]
+        if horizons === nothing || horizons === false
+            push!(base_specs, ("τ", [D[i] == 1 for i in 1:n]))
+        else
+            τvals = horizons === true ?
+                    unique(filter(!ismissing, K[D .== 1])) :
+                    collect(horizons)
+            τvals = sort(unique(filter(≥(0), τvals)))
+            for τ in τvals
+                push!(base_specs, ("τ$(τ)",
+                    [D[i] == 1 && !ismissing(K[i]) && K[i] == τ for i in 1:n]))
+            end
+        end
+        if project_mode
+            wtr_syms, tau_display = build_project_wtr!(d, base_specs, project, wei; verbose=verbose)
+            isempty(wtr_syms) && error("project: all coefficients dropped (collinearity / insufficient variation).")
+        else
+            wtr_syms, tau_display, _ = build_hetby_wtr!(d, base_specs, hetby, wei, D)
+        end
+    elseif horizons === nothing || horizons === false
         push!(wtr_syms, :__wtr_static)
         d[!, :__wtr_static] = Float64.(D .== 1)
         s = sum(wei[i] * d[i, :__wtr_static] for i in 1:n if D[i] == 1)
         s > 0 && (d[!, :__wtr_static] ./= s)
+        tau_display = ["_ATT"]
     else
-        τvals = horizons === true ? 
-                unique(filter(!ismissing, K[D .== 1])) : 
+        τvals = horizons === true ?
+                unique(filter(!ismissing, K[D .== 1])) :
                 collect(horizons)
         τvals = sort(unique(filter(≥(0), τvals)))
-        
+
         for τ in τvals
             nm = Symbol("__wtr$(τ)")
             push!(wtr_syms, nm)
@@ -571,7 +602,19 @@ function fit_bjs_mt(df::DataFrame;
             s = sum(wei[i] * col[i] for i in 1:n)
             s > 0 && (col ./= s)
             d[!, nm] = col
+            push!(tau_display, "τ::$(τ)")
         end
+    end
+
+    # minn: suppress coefficients whose effective sample size is below `minn`.
+    if minn > 0 && !isempty(wtr_syms)
+        keep = minn_keep_mask(d, wtr_syms, wei, D, minn)
+        if !all(keep)
+            @warn "minn: suppressing coefficient(s) with effective sample size < $minn: $(join(tau_display[.!keep], ", "))"
+            wtr_syms = wtr_syms[keep]
+            tau_display = tau_display[keep]
+        end
+        isempty(wtr_syms) && error("minn: all coefficients suppressed (effective sample size < $minn).")
     end
     k_tau = length(wtr_syms)
     
@@ -679,18 +722,8 @@ function fit_bjs_mt(df::DataFrame;
     Σ_full = transpose(E_combined) * E_combined
     
     #=== 13. Assemble names ===#
-    tau_names = if horizons === nothing || horizons === false
-        ["_ATT"]
-    else
-        τvals = Int[]
-        for wname in wtr_syms
-            s = String(wname)
-            τ = parse(Int, replace(s, "__wtr" => ""))
-            push!(τvals, τ)
-        end
-        ["τ::$(τ)" for τ in sort(τvals)]
-    end
-    
+    tau_names = tau_display
+
     pre_names_final = k_pre > 0 ? ["τ::-$(abs(pre_horizons[i]))" for i in valid_pre_idx_chron] : String[]
     ctrl_names_final = k_ctrl > 0 ? String.(valid_ctrl_syms) : String[]
     

@@ -741,6 +741,169 @@ function compute_cluster_scores_controls!(
 end
 
 
+"""
+    build_project_wtr!(d, base_specs, project, wei; verbose=false)
+
+Construct projection weight columns implementing Stata `did_imputation`'s
+`project()` option (continuous treatment-effect heterogeneity).
+
+Instead of reporting a weighted *average* of the imputed individual effects
+`τ̂ = Y - Ŷ(0)`, `project()` reports the coefficients of a (weighted) OLS
+regression of those individual effects on the `project` covariates:
+`τ̂ ≈ β₀ + β₁ x₁ + …`. Each coefficient is obtained via Frisch–Waugh–Lovell:
+residualize the relevant regressor against the others (among the treated cells
+for that base column), normalize by `Σ wᵢ·residᵢ²`, and use the result as a new
+`wtr` column. The existing point-estimate, influence-weight, and cluster-score
+machinery then runs unchanged on these columns.
+
+`base_specs` is a vector of `(basename, mask)` pairs — one entry for the static
+case (`mask = D==1`) or one per horizon (`mask = D==1 & K==h`). For each base it
+emits an intercept component (`<basename>_cons`) and one slope per covariate
+(`<basename>_<var>`). Collinear / degenerate components are dropped with a
+warning, mirroring Stata. Returns `(wtr_syms, wtr_names)`.
+"""
+function build_project_wtr!(d::DataFrame,
+                            base_specs::Vector{<:Tuple{String,<:AbstractVector{Bool}}},
+                            project::Vector{Symbol},
+                            wei::Vector{Float64};
+                            verbose::Bool=false)
+    n = nrow(d)
+    P = [Float64.(d[!, p]) for p in project]
+    nP = length(project)
+    wtr_syms = Symbol[]
+    wtr_names = String[]
+    counter = Ref(0)
+
+    # Weighted-LS residual of y on X (over the local subsample), normalized by
+    # Σ w·resid², written into a full-length column on the rows in S.
+    function add_col!(name::String, S::Vector{Int}, X::AbstractMatrix{Float64},
+                      y::Vector{Float64}, wS::Vector{Float64})
+        if size(X, 2) == 0
+            resid = copy(y)
+        else
+            sw = sqrt.(wS)
+            β = (X .* sw) \ (y .* sw)
+            resid = y .- X * β
+        end
+        denom = sum(wS .* resid .^ 2)
+        if denom < 1e-6
+            verbose && @warn "project: dropping $name (collinearity / insufficient variation)"
+            return
+        end
+        counter[] += 1
+        sym = Symbol("__proj$(counter[])")
+        col = zeros(Float64, n)
+        @inbounds for (li, gi) in enumerate(S)
+            col[gi] = resid[li] / denom
+        end
+        d[!, sym] = col
+        push!(wtr_syms, sym)
+        push!(wtr_names, name)
+    end
+
+    for (basename, mask) in base_specs
+        S = findall(mask)
+        isempty(S) && continue
+        wS = wei[S]
+        # Intercept component: residual of 1 on the covariates (no intercept).
+        Xc = nP == 0 ? Matrix{Float64}(undef, length(S), 0) :
+                       hcat([P[j][S] for j in 1:nP]...)
+        add_col!(basename * "_cons", S, Xc, ones(length(S)), wS)
+        # Slope components: residual of each covariate on intercept + the others.
+        for k in 1:nP
+            yk = P[k][S]
+            others = [P[j][S] for j in 1:nP if j != k]
+            Xk = hcat(ones(length(S)), others...)
+            add_col!(basename * "_" * String(project[k]), S, Xk, yk, wS)
+        end
+    end
+
+    return wtr_syms, wtr_names
+end
+
+
+"""
+    build_hetby_wtr!(d, base_specs, hetby, wei, D)
+
+Construct subgroup weight columns implementing Stata `did_imputation`'s
+`hetby()` option (discrete treatment-effect heterogeneity).
+
+Each base treatment-weight column (the static ATT, or one per horizon) is split
+into one column per distinct value of the `hetby` variable observed among the
+treated, and each split column is normalized so its weighted sum over the
+treated cells equals 1. The estimator then reports a separate (average) effect
+for every (base × subgroup) cell. Returns `(wtr_syms, wtr_names, vals)`.
+"""
+function build_hetby_wtr!(d::DataFrame,
+                          base_specs::Vector{<:Tuple{String,<:AbstractVector{Bool}}},
+                          hetby::Symbol,
+                          wei::Vector{Float64},
+                          D::AbstractVector{<:Integer})
+    n = nrow(d)
+    hv = d[!, hetby]
+    vals = sort(unique(hv[i] for i in 1:n if D[i] == 1 && !ismissing(hv[i])))
+    length(vals) > 30 && error("hetby: variable $hetby takes more than 30 values among the treated.")
+    isempty(vals) && error("hetby: variable $hetby is always missing among the treated.")
+
+    wtr_syms = Symbol[]
+    wtr_names = String[]
+    counter = Ref(0)
+    for (basename, mask) in base_specs
+        for val in vals
+            col = zeros(Float64, n)
+            s = 0.0
+            @inbounds for i in 1:n
+                if mask[i] && !ismissing(hv[i]) && hv[i] == val
+                    col[i] = 1.0
+                    s += wei[i]
+                end
+            end
+            s <= 0 && continue
+            col ./= s
+            counter[] += 1
+            sym = Symbol("__het$(counter[])")
+            d[!, sym] = col
+            push!(wtr_syms, sym)
+            push!(wtr_names, "$(basename)_$(val)")
+        end
+    end
+    return wtr_syms, wtr_names, vals
+end
+
+
+"""
+    minn_keep_mask(d, wtr_syms, wei, D, minn) -> BitVector
+
+For each treatment-weight column, compute the effective sample size behind the
+coefficient as `1 / HHI`, where `HHI = Σ (wᵢ·vᵢ / Σ wⱼ·|vⱼ|)²` over the treated
+cells (matching Stata `did_imputation`'s `minn` rule). Returns a mask that is
+`false` for columns whose effective sample size is below `minn` (or that carry
+no weight at all), so they can be suppressed.
+"""
+function minn_keep_mask(d::DataFrame, wtr_syms::Vector{Symbol},
+                        wei::Vector{Float64}, D::AbstractVector{<:Integer}, minn::Real)
+    n = nrow(d)
+    k = length(wtr_syms)
+    keep = trues(k)
+    for j in 1:k
+        v = Float64.(coalesce.(d[!, wtr_syms[j]], 0.0))
+        s = 0.0
+        @inbounds for i in 1:n
+            D[i] == 1 && (s += wei[i] * abs(v[i]))
+        end
+        if s == 0
+            keep[j] = false
+            continue
+        end
+        hhi = 0.0
+        @inbounds for i in 1:n
+            D[i] == 1 && (hhi += (v[i] * wei[i] / s)^2)
+        end
+        hhi > 1 / minn && (keep[j] = false)
+    end
+    return keep
+end
+
 
 """
     fit_bjs_st(df::DataFrame;
@@ -787,11 +950,21 @@ its analytic influence-function variance estimation.
     - `true` → all negative horizons (τ < 0)
     - `Int` → number of pre-periods (e.g., `5` means K=-1 to K=-5)
     - `Vector{Int}` → specific pre-horizons
+- `project::Vector{Symbol} = Symbol[]`: Continuous treatment-effect heterogeneity
+    (Stata `project()`). Reports an OLS projection of the individual effects on these
+    covariates: an intercept `τ_cons` plus a slope `τ_<var>` per covariate, and per
+    horizon when combined with `horizons`. Cannot be combined with `hetby`.
+- `hetby::Union{Nothing,Symbol} = nothing`: Discrete treatment-effect heterogeneity
+    (Stata `hetby()`). Reports a separate effect for each value of this variable
+    (up to 30 values), named `τ_<value>` or `τ<h>_<value>`. Cannot be combined with `project`.
+- `minn::Real = 0`: Minimum effective sample size per coefficient (Stata `minn`),
+    defaulting to `0` which keeps every coefficient. Set `minn = 30` to reproduce Stata's
+    default suppression of thin coefficients.
 - `avgeffectsby`: Grouping variables for averaging treatment effects. Default is `[g, t]` (cohort x time), matching Stata's default behavior.
 - `control_type::Symbol = :notyet`: Donor pool definition.
 - `tol::Float64 = 1e-6`: Convergence tolerance for influence weight iteration.
 - `maxiter::Int = 1000`: Maximum iterations for influence weight computation.
-- `autosample::Bool = true`: If true (default), drop treated observations where FE cannot 
+- `autosample::Bool = true`: If true (default), drop treated observations where FE cannot
                              be imputed from donor sample. If false, error.
 - `verbose::Bool = false`: If warnings should be printed. (e.g. dropping of singletons, collinear pretrends or controls)
 
@@ -814,6 +987,9 @@ function fit_bjs_st(df::DataFrame;
     cluster::Union{Nothing,Symbol} = nothing,
     horizons::Union{Nothing,Bool,Vector{Int}} = nothing,
     pretrends::Union{Nothing,Bool,Int,Vector{Int}} = nothing,
+    project::Vector{Symbol} = Symbol[],
+    hetby::Union{Nothing,Symbol} = nothing,
+    minn::Real = 0,
     avgeffectsby::Union{Nothing,Vector{Symbol}} = nothing,
     control_type::Symbol = :notyet,
     tol::Float64 = 1e-6,
@@ -824,12 +1000,18 @@ function fit_bjs_st(df::DataFrame;
     if avgeffectsby === nothing
         avgeffectsby = [g, t]
     end
-    
+    project_mode = !isempty(project)
+    hetby_mode = hetby !== nothing
+    project_mode && hetby_mode &&
+        error("Options project and hetby cannot be combined.")
+
     #=== 0. Copy and clean data ===#
     d = copy(df)
     d[!, g] = replace(d[!, g], 0 => missing)
     key_vars = Symbol[y, id, t]
     append!(key_vars, controls)
+    append!(key_vars, project)
+    hetby_mode && push!(key_vars, hetby)
     if !isnothing(weights); push!(key_vars, weights); end
     if !isnothing(cluster); push!(key_vars, cluster); end
     key_vars = unique(key_vars)
@@ -939,17 +1121,40 @@ function fit_bjs_st(df::DataFrame;
     
     #=== 5. Construct wtr weights for tau ===#
     wtr_syms = Symbol[]
-    if horizons === nothing || horizons === false
+    tau_display = String[]   # display names, parallel to wtr_syms
+    if project_mode || hetby_mode
+        # Build 0/1 base masks (static or per-horizon) shared by project & hetby.
+        base_specs = Tuple{String,Vector{Bool}}[]
+        if horizons === nothing || horizons === false
+            push!(base_specs, ("τ", [D[i] == 1 for i in 1:n]))
+        else
+            τvals = horizons === true ?
+                    unique(filter(!ismissing, K[D .== 1])) :
+                    collect(horizons)
+            τvals = sort(unique(filter(≥(0), τvals)))
+            for τ in τvals
+                push!(base_specs, ("τ$(τ)",
+                    [D[i] == 1 && !ismissing(K[i]) && K[i] == τ for i in 1:n]))
+            end
+        end
+        if project_mode
+            wtr_syms, tau_display = build_project_wtr!(d, base_specs, project, wei; verbose=verbose)
+            isempty(wtr_syms) && error("project: all coefficients dropped (collinearity / insufficient variation).")
+        else
+            wtr_syms, tau_display, _ = build_hetby_wtr!(d, base_specs, hetby, wei, D)
+        end
+    elseif horizons === nothing || horizons === false
         push!(wtr_syms, :__wtr_static)
         d[!, :__wtr_static] = Float64.(D .== 1)
         s = sum(wei[i] * d[i, :__wtr_static] for i in 1:n if D[i] == 1)
         s > 0 && (d[!, :__wtr_static] ./= s)
+        tau_display = ["_ATT"]
     else
-        τvals = horizons === true ? 
-                unique(filter(!ismissing, K[D .== 1])) : 
+        τvals = horizons === true ?
+                unique(filter(!ismissing, K[D .== 1])) :
                 collect(horizons)
         τvals = sort(unique(filter(≥(0), τvals)))
-        
+
         for τ in τvals
             nm = Symbol("__wtr$(τ)")
             push!(wtr_syms, nm)
@@ -962,7 +1167,19 @@ function fit_bjs_st(df::DataFrame;
             s = sum(wei[i] * col[i] for i in 1:n)
             s > 0 && (col ./= s)
             d[!, nm] = col
+            push!(tau_display, "τ::$(τ)")
         end
+    end
+
+    # minn: suppress coefficients whose effective sample size is below `minn`.
+    if minn > 0 && !isempty(wtr_syms)
+        keep = minn_keep_mask(d, wtr_syms, wei, D, minn)
+        if !all(keep)
+            @warn "minn: suppressing coefficient(s) with effective sample size < $minn: $(join(tau_display[.!keep], ", "))"
+            wtr_syms = wtr_syms[keep]
+            tau_display = tau_display[keep]
+        end
+        isempty(wtr_syms) && error("minn: all coefficients suppressed (effective sample size < $minn).")
     end
     k_tau = length(wtr_syms)
     
@@ -1070,21 +1287,11 @@ function fit_bjs_st(df::DataFrame;
     Σ_full = transpose(E_combined) * E_combined
     
     #=== 13. Assemble names ===#
-    tau_names = if horizons === nothing || horizons === false
-        ["_ATT"]
-    else
-        τvals = Int[]
-        for wname in wtr_syms
-            s = String(wname)
-            τ = parse(Int, replace(s, "__wtr" => ""))
-            push!(τvals, τ)
-        end
-        ["τ::$(τ)" for τ in sort(τvals)]
-    end
-    
+    tau_names = tau_display
+
     pre_names_final = k_pre > 0 ? ["τ::-$(abs(pre_horizons[i]))" for i in valid_pre_idx_chron] : String[]
     ctrl_names_final = k_ctrl > 0 ? String.(valid_ctrl_syms) : String[]
-    
+
     all_names = vcat(pre_names_final, tau_names, ctrl_names_final)
     
     #=== 14. DOF and return ===#
@@ -1157,11 +1364,23 @@ its analytic influence-function variance estimation.
     - `true` → all negative horizons (τ < 0)
     - `Int` → number of pre-periods (e.g., `5` means K=-1 to K=-5)
     - `Vector{Int}` → specific pre-horizons
+- `project::Vector{Symbol} = Symbol[]`: Continuous treatment-effect heterogeneity
+    (Stata `project()`). Reports the coefficients of an OLS projection of the
+    individual effects on these covariates: an intercept `τ_cons` plus a slope
+    `τ_<var>` per covariate (per horizon when combined with `horizons`). A positive,
+    significant slope means the effect grows with that covariate. Cannot be combined with `hetby`.
+- `hetby::Union{Nothing,Symbol} = nothing`: Discrete treatment-effect heterogeneity
+    (Stata `hetby()`). Reports a separate effect for each value of this variable
+    (≤30 values), named `τ_<value>` (or `τ<h>_<value>` per horizon). Cannot be combined with `project`.
+- `minn::Real = 0`: Minimum effective sample size per coefficient (Stata `minn`, but
+    defaulting to `0` = off for backward compatibility). When `> 0`, coefficients whose
+    effective sample size `1/HHI` falls below `minn` are suppressed with a warning.
+    `minn = 30` reproduces Stata's default behavior.
 - `avgeffectsby`: Grouping variables for averaging treatment effects. Default is `[g, t]` (cohort x time), matching Stata's default behavior.
 - `control_type::Symbol = :notyet`: Donor pool definition.
 - `tol::Float64 = 1e-6`: Convergence tolerance for influence weight iteration.
 - `maxiter::Int = 1000`: Maximum iterations for influence weight computation.
-- `autosample::Bool = true`: If true (default), drop treated observations where FE cannot 
+- `autosample::Bool = true`: If true (default), drop treated observations where FE cannot
                              be imputed from donor sample. If false, error.
 - `verbose::Bool = false`: If warnings should be printed. (e.g. dropping of singletons, collinear pretrends or controls)
 - `multithreaded::Bool = true`: whether to multithread or not.
@@ -1185,6 +1404,9 @@ function fit_bjs(df::DataFrame;
     cluster::Union{Nothing,Symbol} = nothing,
     horizons::Union{Nothing,Bool,Vector{Int}} = nothing,
     pretrends::Union{Nothing,Bool,Int,Vector{Int}} = nothing,
+    project::Vector{Symbol} = Symbol[],
+    hetby::Union{Nothing,Symbol} = nothing,
+    minn::Real = 0,
     avgeffectsby::Union{Nothing,Vector{Symbol}} = nothing,
     control_type::Symbol = :notyet,
     tol::Float64 = 1e-6,
@@ -1193,12 +1415,13 @@ function fit_bjs(df::DataFrame;
     verbose::Bool = false,
     multithreaded::Bool = true
     )
-    
+
     if multithreaded
-        return fit_bjs_mt(df; 
+        return fit_bjs_mt(df;
             y=y, id=id, t=t, g=g,
             controls=controls, fe=fe, weights=weights,
             cluster=cluster, horizons=horizons, pretrends=pretrends,
+            project=project, hetby=hetby, minn=minn,
             avgeffectsby=avgeffectsby, control_type=control_type,
             tol=tol, maxiter=maxiter, autosample=autosample,verbose=verbose
         )
@@ -1207,6 +1430,7 @@ function fit_bjs(df::DataFrame;
             y=y, id=id, t=t, g=g,
             controls=controls, fe=fe, weights=weights,
             cluster=cluster, horizons=horizons, pretrends=pretrends,
+            project=project, hetby=hetby, minn=minn,
             avgeffectsby=avgeffectsby, control_type=control_type,
             tol=tol, maxiter=maxiter, autosample=autosample,verbose=verbose
         )
@@ -1230,6 +1454,9 @@ function fit_bjs_static(df::DataFrame;
     fe::Tuple = (id, t),
     weights::Union{Nothing,Symbol} = nothing,
     cluster::Union{Nothing,Symbol} = nothing,
+    project::Vector{Symbol} = Symbol[],
+    hetby::Union{Nothing,Symbol} = nothing,
+    minn::Real = 0,
     control_type::Symbol = :notyet,
     tol::Float64 = 1e-6,
     maxiter::Int = 1000,
@@ -1237,10 +1464,11 @@ function fit_bjs_static(df::DataFrame;
     verbose::Bool = false,
     multithreaded::Bool = true
     )
-    
+
     return fit_bjs(df; y=y, id=id, t=t, g=g,
                    controls=controls, fe=fe, weights=weights,
                    cluster=cluster, horizons=nothing, pretrends=nothing,
+                   project=project, hetby=hetby, minn=minn,
                    control_type=control_type, tol=tol, maxiter=maxiter,
                    autosample=autosample,verbose=verbose,
                    multithreaded = multithreaded)
@@ -1267,6 +1495,9 @@ function fit_bjs_dynamic(df::DataFrame;
     cluster::Union{Nothing,Symbol} = nothing,
     horizons::Union{Bool,Vector{Int}} = true,
     pretrends::Union{Nothing,Bool,Int,Vector{Int}} = true,
+    project::Vector{Symbol} = Symbol[],
+    hetby::Union{Nothing,Symbol} = nothing,
+    minn::Real = 0,
     avgeffectsby::Union{Nothing,Vector{Symbol}} = nothing,
     control_type::Symbol = :notyet,
     tol::Float64 = 1e-6,
@@ -1274,10 +1505,11 @@ function fit_bjs_dynamic(df::DataFrame;
     autosample::Bool = true,
     verbose::Bool = false,
     multithreaded::Bool = true)
-    
+
     return fit_bjs(df; y=y, id=id, t=t, g=g,
                    controls=controls, fe=fe, weights=weights,
                    cluster=cluster, horizons=horizons, pretrends=pretrends,
+                   project=project, hetby=hetby, minn=minn,
                    avgeffectsby=avgeffectsby, control_type=control_type,
                    tol=tol, maxiter=maxiter, autosample=autosample,verbose=verbose,
                    multithreaded = multithreaded)
