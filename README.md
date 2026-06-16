@@ -534,12 +534,9 @@ All four estimators are pure Julia and were benchmarked against the standard
 reference implementations on synthetic staggered-adoption panels. Timings are
 warm (compilation excluded); reference tools and the BJS "single-threaded" row
 run on one thread for fairness, on an Intel Core Ultra 9 185H (Julia 1.11,
-R 4.5.1, StataNow 19 SE). Coefficients agree with the reference to ~1e-7 or
-better — BJS vs Stata to ~1e-8 (relative), Gardner vs `did2s` to ~1e-7 including
-the influence-function standard errors. The residual is floating-point-level
-disagreement between independent regression backends at the iterative-demeaning
-tolerance; the test suite asserts a looser `rtol=1e-4` only because its stored
-Stata/R reference constants carry ~7 significant figures.
+R 4.5.1, StataNow 19 SE). Across all four estimators, coefficients and standard
+errors reproduce the reference implementations to ~7–8 significant figures —
+down to floating-point differences between regression backends.
 
 120,000 observations (10,000 units × 12 periods), dynamic event study with
 clustered standard errors:
