@@ -532,28 +532,34 @@ influence-function variance) and lacks the `hetby` / `project` options;
 
 All four estimators are pure Julia and were benchmarked against the standard
 reference implementations on synthetic staggered-adoption panels. Timings are
-warm (compilation excluded) and **single-threaded for fairness**, on an Intel
-Core Ultra 9 185H (Julia 1.11, R 4.5.1, StataNow 19 SE). Across every case the
-estimated coefficients match the reference implementation to ≈1e-4 — and for
-BJS, so do the full influence-function standard errors.
+warm (compilation excluded); reference tools and the BJS "single-threaded" row
+run on one thread for fairness, on an Intel Core Ultra 9 185H (Julia 1.11,
+R 4.5.1, StataNow 19 SE). Across every case the estimated coefficients match the
+reference implementation to ≈1e-4 — and for BJS, so do the full
+influence-function standard errors.
 
 120,000 observations (10,000 units × 12 periods), dynamic event study with
 clustered standard errors:
 
 | Estimator | Reference | Reference | StagDiDModels | Speed-up |
 |-----------|-----------|----------:|--------------:|---------:|
-| BJS imputation | Stata `did_imputation` | 10.5 s | 1.33 s | **7.9×** |
-| Gardner two-stage | R `did2s` | 17.4 s | 7.45 s | **2.3×** |
-| Sun–Abraham | R `fixest::sunab` | 0.17 s | 0.13 s | **1.3×** |
-| TWFE event study | R `fixest::feols` | 0.05 s | 0.09 s | 0.6× |
+| BJS imputation — single-threaded | Stata `did_imputation` | 12.5 s | 1.30 s | **9.6×** |
+| BJS imputation — multithreaded (16 cores) | Stata `did_imputation` | 12.5 s | 0.93 s | **13.4×** |
+| Gardner two-stage | R `did2s` | 18.4 s | 4.02 s | **4.6×** |
+| Sun–Abraham | R `fixest::sunab` | 0.16 s | 0.12 s | **1.3×** |
+| TWFE event study | R `fixest::feols` | 0.04 s | 0.08 s | 0.5× |
 
 Notes:
 
-- **Speed-ups grow on smaller panels** — e.g. at 12,000 obs BJS is ~9× and
-  Gardner ~13× faster.
-- **BJS** has an optional multithreaded path (`multithreaded=true`, the default)
-  that adds a further ~1.35× here (→ ~1.0 s, **10.6×** vs Stata). Stata SE is
-  single-threaded; even granting Stata MP an optimistic 2–3× the lead holds.
+- **BJS** is ~9–11× faster than Stata `did_imputation` single-threaded and
+  ~12–15× with the multithreaded path (`multithreaded=true`, the default),
+  roughly flat across 12k–120k obs. Stata SE is single-threaded; even granting
+  Stata MP an optimistic 2–3× the lead holds.
+- **Gardner** speed-up *widens on smaller panels* — ~16× at 12k obs, narrowing
+  to 4.6× at 120k because its influence-function SE solve has fixed-effect
+  fill-in that grows with the number of units. (`did2s` scales worse still.)
+- **Sun–Abraham** is a modest win (~1.3× at 120k, ~2.5× at 12k); it's a single
+  saturated regression plus a cheap aggregation, so it's backend-bound.
 - **TWFE** is effectively a tie: `fixest`'s compiled core is marginally faster on
   a plain event-study `feols`. The value here is the unified API and matching
   output, not raw speed.
