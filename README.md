@@ -524,6 +524,44 @@ All estimator functions accept:
 | `fit_twfe_dynamic()` | `fixest::feols(y ~ i(event_time) \| id + t)` | - |
 
 
+## Performance
+
+All four estimators are pure Julia and were benchmarked against the standard
+reference implementations on synthetic staggered-adoption panels. Timings are
+warm (compilation excluded) and **single-threaded for fairness**, on an Intel
+Core Ultra 9 185H (Julia 1.11, R 4.5.1, StataNow 19 SE). Across every case the
+estimated coefficients match the reference implementation to ≈1e-4 — and for
+BJS, so do the full influence-function standard errors.
+
+120,000 observations (10,000 units × 12 periods), dynamic event study with
+clustered standard errors:
+
+| Estimator | Reference | Reference | StagDiDModels | Speed-up |
+|-----------|-----------|----------:|--------------:|---------:|
+| BJS imputation | Stata `did_imputation` | 10.5 s | 1.33 s | **7.9×** |
+| Gardner two-stage | R `did2s` | 17.4 s | 7.45 s | **2.3×** |
+| Sun–Abraham | R `fixest::sunab` | 0.17 s | 0.13 s | **1.3×** |
+| TWFE event study | R `fixest::feols` | 0.05 s | 0.09 s | 0.6× |
+
+Notes:
+
+- **Speed-ups grow on smaller panels** — e.g. at 12,000 obs BJS is ~9× and
+  Gardner ~13× faster.
+- **BJS** has an optional multithreaded path (`multithreaded=true`, the default)
+  that adds a further ~1.35× here (→ ~1.0 s, **10.6×** vs Stata). Stata SE is
+  single-threaded; even granting Stata MP an optimistic 2–3× the lead holds.
+- **TWFE** is effectively a tie: `fixest`'s compiled core is marginally faster on
+  a plain event-study `feols`. The value here is the unified API and matching
+  output, not raw speed.
+- The R `didimputation` package runs the BJS estimator faster than Stata, but it
+  reports *conservative* standard errors (it omits the influence-function
+  variance) and lacks the `hetby` / `project` heterogeneity options.
+  StagDiDModels follows the Stata `did_imputation` implementation — which it
+  reproduces exactly — so `didimputation` is not a like-for-like comparison and
+  is not shown.
+
+Benchmark harnesses are in [`bench/`](bench/).
+
 ## References
 
 - Borusyak, K., Jaravel, X., & Spiess, J. (2023). Revisiting event study designs: Robust and efficient estimation.
