@@ -1,58 +1,58 @@
 """
-    cumulative_effects(m::StatsAPI.StatisticalModel; 
+    cumulative_effects(m::StatsAPI.StatisticalModel;
                        pattern::Regex = r"τ::(-?\\d+)",
-                       ref_period::Union{Nothing,Int} = nothing)
+                       ref_period::Union{Nothing,Int} = nothing,
+                       level::Real = 0.95)
 
-Compute cumulative treatment effects and their standard errors for plotting.
+Compute cumulative treatment effects (e.g. cumulative abnormal returns) and their
+confidence bounds for plotting. The reference period is normalized to zero, so the
+cumulative path passes through 0 at the reference.
 
-This function creates cumulative effects that sum "away from" the reference period:
-- **Pre-treatment**: Cumulates backwards from reference (if ref=-1, cum(-3) = β_{-3} + β_{-2})  
-- **Post-treatment**: Cumulates forward from period 0 (cum(2) = β_0 + β_1 + β_2)
+- **Post-treatment**: cumulates forward from period 0 — `cum(h) = β₀ + β₁ + … + β_h`.
+- **Pre-treatment**: cumulates *back* toward the reference, so pre-period
+  coefficients enter with a negative sign — e.g. with `ref = -1`,
+  `cum(-3) = -(β₋₃ + β₋₂)`. This makes the curve a continuous cumulative-return
+  path anchored at the reference; under parallel trends the pre-period values are ≈ 0.
 
-Works with all DiD model types: `BJSModel` (Bootstrap version only), `GardnerModel`, `SunabModel`, `TWFEModel`.
+Standard errors come from `A·Σ·Aᵀ` for each linear combination (full coefficient
+covariance, including cross-covariances), and the confidence bounds use a
+t-quantile with the model's residual degrees of freedom (matching the estimators'
+own `confint`).
+
+Works with all DiD model types: `BJSModel`, `GardnerModel`, `SunabModel`, `TWFEModel`.
 
 # Arguments
 - `m::StatisticalModel`: Event study model with τ coefficients (BJS, Gardner, Sun-Abraham, TWFE)
 - `pattern::Regex`: Pattern to extract τ values (default matches "τ::-2", "τ::3", etc.)
 - `ref_period::Union{Nothing,Int}`: Reference period that was excluded (default: auto-detect)
+- `level::Real`: Confidence level for the bounds (default `0.95`)
 
 # Returns
 NamedTuple with:
-- `τ`: Vector of time periods  
+- `τ`: Vector of event times
 - `cumulative`: Vector of cumulative effects
 - `std_errors`: Vector of standard errors
-- `conf_low`: Lower 95% confidence bounds
-- `conf_high`: Upper 95% confidence bounds
+- `conf_low`: Lower confidence bounds at `level`
+- `conf_high`: Upper confidence bounds at `level`
 
 # Examples
 ```julia
-# BJS event study
+# Cumulative abnormal returns from a BJS event study
 m_bjs = fit_bjs_dynamic(df; y=:ret, id=:fund, t=:month, g=:g)
-cum_bjs = cumulative_effects(m_bjs)
+cum_bjs = cumulative_effects(m_bjs)               # 95% bounds
+cum_90  = cumulative_effects(m_bjs; level = 0.90) # 90% bounds
 
-# Gardner event study  
-m_gardner = fit_did2s_dynamic(df; y=:ret, id=:fund, t=:month, g=:g, cluster=:fund)
-cum_gardner = cumulative_effects(m_gardner)
-
-# Sun-Abraham event study
-m_sunab = fit_sunab(df; y=:ret, id=:fund, t=:month, g=:g, cluster=:fund)
-cum_sunab = cumulative_effects(m_sunab)
-
-# TWFE event study
-m_twfe = fit_twfe_dynamic(df; y=:ret, id=:fund, t=:month, g=:g, cluster=:fund)
-cum_twfe = cumulative_effects(m_twfe)
-
-# Plot any of them
-using Plots
-plot(cum_bjs.τ, cum_bjs.cumulative, 
-     ribbon=1.96.*cum_bjs.std_errors,
-     xlabel="Event Time", ylabel="Cumulative Effect",
-     title="BJS Cumulative Effects")
+# Works with any estimator
+m_gardner = fit_gardner_dynamic(df; y=:ret, id=:fund, t=:month, g=:g, cluster=:fund)
+m_sunab   = fit_sunab(df;          y=:ret, id=:fund, t=:month, g=:g, cluster=:fund)
+m_twfe    = fit_twfe_dynamic(df;   y=:ret, id=:fund, t=:month, g=:g, cluster=:fund)
+cum = cumulative_effects(m_gardner)
 ```
 """
-function cumulative_effects(m::StatsAPI.StatisticalModel; 
+function cumulative_effects(m::StatsAPI.StatisticalModel;
                             pattern::Regex = r"τ::(-?\d+)",
-                            ref_period::Union{Nothing,Int} = nothing)
+                            ref_period::Union{Nothing,Int} = nothing,
+                            level::Real = 0.95)
     
     nms = StatsAPI.coefnames(m)
     coefs = StatsAPI.coef(m)
@@ -137,10 +137,13 @@ function cumulative_effects(m::StatsAPI.StatisticalModel;
     cumulative = A * coefs
     cumulative_vcov = A * vcov_mat * A'
     std_errors = sqrt.(diag(cumulative_vcov))
-    
-    # 95% confidence intervals
-    conf_low = cumulative .- 1.96 .* std_errors
-    conf_high = cumulative .+ 1.96 .* std_errors
+
+    # Confidence bounds at `level`, using a t-quantile with the model's residual
+    # degrees of freedom (consistent with the estimators' own `confint`).
+    α = 1 - level
+    crit = quantile(TDist(StatsAPI.dof_residual(m)), 1 - α / 2)
+    conf_low = cumulative .- crit .* std_errors
+    conf_high = cumulative .+ crit .* std_errors
     
     return (
         τ = τ_values,

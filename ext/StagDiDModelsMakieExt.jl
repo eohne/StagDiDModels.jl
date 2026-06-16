@@ -189,8 +189,8 @@ cum = cumulative_effects(m)
 fig = plot_cumulative(cum)
 ```
 """
-function StagDiDModels.plot_cumulative(m::StatsAPI.StatisticalModel; kwargs...)
-    cum = cumulative_effects(m)
+function StagDiDModels.plot_cumulative(m::StatsAPI.StatisticalModel; level::Real = 0.95, kwargs...)
+    cum = cumulative_effects(m; level = level)
     return plot_cumulative(cum; kwargs...)
 end
 
