@@ -84,4 +84,7 @@ function plot_comparison end
 # Export plotting functions
 export plot_event_study, plot_cumulative, plot_comparison
 
+# Precompilation (runs a tiny end-to-end workload at build time to cut TTFX)
+include("precompile.jl")
+
 end
