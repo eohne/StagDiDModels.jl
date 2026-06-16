@@ -140,7 +140,7 @@ function compute_cluster_scores_pretrends_mt!(
         if i <= length(esample) && esample[i] && i <= length(preresid_raw)
             val = preresid_raw[i]
             if !ismissing(val)
-                orig_row = d_donors[i, :__orig_row]
+                orig_row = donor_global_idx[i]   # typed vector; == d_donors[i, :__orig_row]
                 preresid[orig_row] = Float64(val)
             end
         end
@@ -188,7 +188,7 @@ function compute_cluster_scores_pretrends_mt!(
             if i <= length(esample_resid) && esample_resid[i] && i <= length(preweight_raw)
                 val = preweight_raw[i]
                 if !ismissing(val)
-                    orig_row = d_donors[i, :__orig_row]
+                    orig_row = donor_global_idx[i]   # typed vector; == d_donors[i, :__orig_row]
                     preweight[orig_row] = Float64(val) * wei[orig_row]
                 end
             end
@@ -376,7 +376,7 @@ function compute_cluster_scores_controls_mt!(
             if i <= length(esample_resid) && esample_resid[i] && i <= length(ctrlweight_raw)
                 val = ctrlweight_raw[i]
                 if !ismissing(val)
-                    orig_row = d_donors[i, :__orig_row]
+                    orig_row = donor_global_idx[i]   # typed vector; == d_donors[i, :__orig_row]
                     ctrlweight[orig_row] = Float64(val) * wei[orig_row]
                 end
             end
@@ -467,10 +467,12 @@ function fit_bjs_mt(df::DataFrame;
     d[!, :__touse] = trues(n)
     
     #=== 1. Event time K and treatment indicator D ===#
+    gcol = d[!, g]   # hoist columns: scalar d[i, col] indexing is type-unstable/allocating
+    tcol = d[!, t]
     K = Vector{Union{Int,Missing}}(undef, n)
-    for i in 1:n
-        gi = d[i, g]
-        K[i] = (ismissing(gi) || gi == 0) ? missing : d[i, t] - gi
+    @inbounds for i in 1:n
+        gi = gcol[i]
+        K[i] = (ismissing(gi) || gi == 0) ? missing : tcol[i] - gi
     end
     d[!, :K] = K
     
@@ -581,9 +583,13 @@ function fit_bjs_mt(df::DataFrame;
         end
     elseif horizons === nothing || horizons === false
         push!(wtr_syms, :__wtr_static)
-        d[!, :__wtr_static] = Float64.(D .== 1)
-        s = sum(wei[i] * d[i, :__wtr_static] for i in 1:n if D[i] == 1)
-        s > 0 && (d[!, :__wtr_static] ./= s)
+        col = Float64.(D .== 1)
+        s = 0.0
+        @inbounds for i in 1:n
+            D[i] == 1 && (s += wei[i] * col[i])
+        end
+        s > 0 && (col ./= s)
+        d[!, :__wtr_static] = col
         tau_display = ["_ATT"]
     else
         τvals = horizons === true ?
@@ -622,11 +628,11 @@ function fit_bjs_mt(df::DataFrame;
     #=== 6. Point estimates for tau ===#
     β_tau = zeros(Float64, k_tau)
     for j in 1:k_tau
-        wname = wtr_syms[j]
+        wcol = Float64.(coalesce.(d[!, wtr_syms[j]], 0.0))   # hoist typed column
         s = 0.0
-        for i in 1:n
+        @inbounds for i in 1:n
             if D[i] == 1
-                s += eff[i] * d[i, wname] * wei[i]
+                s += eff[i] * wcol[i] * wei[i]
             end
         end
         β_tau[j] = s
@@ -1077,9 +1083,58 @@ function _factorize(col::AbstractVector)
     return codes, nc
 end
 
+# Cluster influence score for one tau column j, writing E[:, j]. Caller supplies
+# the six scratch buffers, reset on entry.
+@inline function _tau_score_col!(E, j::Int, W, wtrj, treated, wei,
+                                 pair_idx, avgby_idx, cluster_idx, effect, resid0, n::Int,
+                                 cw_by_pair, clusterweight, smartdenom_by_avgby,
+                                 smartweight, avgtau_by_avgby, resid)
+    fill!(cw_by_pair, 0.0); fill!(clusterweight, 0.0)
+    fill!(smartdenom_by_avgby, 0.0); fill!(smartweight, 0.0)
+    fill!(avgtau_by_avgby, 0.0); fill!(resid, 0.0)
+    @inbounds begin
+        for i in 1:n
+            if treated[i] && wtrj[i] != 0.0
+                cw_by_pair[pair_idx[i]] += wei[i] * wtrj[i]
+            end
+        end
+        for i in 1:n
+            if treated[i]
+                clusterweight[i] = cw_by_pair[pair_idx[i]]
+            end
+        end
+        for i in 1:n
+            if treated[i] && wtrj[i] != 0.0
+                smartdenom_by_avgby[avgby_idx[i]] += clusterweight[i] * wei[i] * wtrj[i]
+            end
+        end
+        for i in 1:n
+            if treated[i] && wtrj[i] != 0.0
+                sd = smartdenom_by_avgby[avgby_idx[i]]
+                if sd > 1e-14
+                    smartweight[i] = clusterweight[i] * wei[i] * wtrj[i] / sd
+                end
+            end
+        end
+        for i in 1:n
+            if treated[i]
+                avgtau_by_avgby[avgby_idx[i]] += effect[i] * smartweight[i]
+            end
+        end
+        for i in 1:n
+            resid[i] = treated[i] ? effect[i] - avgtau_by_avgby[avgby_idx[i]] : resid0[i]
+        end
+        for i in 1:n
+            E[cluster_idx[i], j] += wei[i] * W[i, j] * resid[i]
+        end
+    end
+    return nothing
+end
+
 """
 Compute cluster scores for tau coefficients.
-All indexing pre-computed, zero allocations in main loop.
+All indexing pre-computed; per-column scoring is serial (one zero-allocation
+buffer set) or threaded (one buffer set per task over disjoint column chunks).
 """
 function compute_cluster_scores_tau_mt!(
     d::DataFrame,
@@ -1170,79 +1225,18 @@ function compute_cluster_scores_tau_mt!(
     # Result matrix
     E = zeros(Float64, G, k)
     
-    # === WORK BUFFERS (allocated once) ===
-    cw_by_pair = zeros(Float64, n_pairs)
-    clusterweight = zeros(Float64, n)
-    smartdenom_by_avgby = zeros(Float64, n_avgby)
-    smartweight = zeros(Float64, n)
-    avgtau_by_avgby = zeros(Float64, n_avgby)
-    resid = zeros(Float64, n)
-    
-    # === MAIN LOOP - NO ALLOCATIONS ===
+    # Per-column scoring (serial, single zero-allocation buffer set). Threading
+    # this kernel was tried and reverted: it broke run-to-run determinism for a
+    # only-marginal speedup, and the per-task buffers added allocations.
+    cwp = zeros(Float64, n_pairs); cw = zeros(Float64, n)
+    sdv = zeros(Float64, n_avgby); sw = zeros(Float64, n)
+    atv = zeros(Float64, n_avgby); rs = zeros(Float64, n)
     for j in 1:k
-        # Reset buffers
-        fill!(cw_by_pair, 0.0)
-        fill!(clusterweight, 0.0)
-        fill!(smartdenom_by_avgby, 0.0)
-        fill!(smartweight, 0.0)
-        fill!(avgtau_by_avgby, 0.0)
-        fill!(resid, 0.0)
-        
-        wtrj = wtr_cols[j]
-        
-        # Compute cluster weights by pair
-        @inbounds for i in 1:n
-            if treated[i] && wtrj[i] != 0.0
-                cw_by_pair[pair_idx[i]] += wei[i] * wtrj[i]
-            end
-        end
-        
-        # Map to observation-level
-        @inbounds for i in 1:n
-            if treated[i]
-                clusterweight[i] = cw_by_pair[pair_idx[i]]
-            end
-        end
-        
-        # Compute smartdenom
-        @inbounds for i in 1:n
-            if treated[i] && wtrj[i] != 0.0
-                smartdenom_by_avgby[avgby_idx[i]] += clusterweight[i] * wei[i] * wtrj[i]
-            end
-        end
-        
-        # Compute smart weights
-        @inbounds for i in 1:n
-            if treated[i] && wtrj[i] != 0.0
-                sd = smartdenom_by_avgby[avgby_idx[i]]
-                if sd > 1e-14
-                    smartweight[i] = clusterweight[i] * wei[i] * wtrj[i] / sd
-                end
-            end
-        end
-        
-        # Compute avgtau
-        @inbounds for i in 1:n
-            if treated[i]
-                avgtau_by_avgby[avgby_idx[i]] += effect[i] * smartweight[i]
-            end
-        end
-        
-        # Compute residuals
-        @inbounds for i in 1:n
-            if treated[i]
-                resid[i] = effect[i] - avgtau_by_avgby[avgby_idx[i]]
-            else
-                resid[i] = resid0[i]
-            end
-        end
-        
-        # Accumulate into E
-        @inbounds for i in 1:n
-            E[cluster_idx[i], j] += wei[i] * W[i, j] * resid[i]
-        end
+        _tau_score_col!(E, j, W, wtr_cols[j], treated, wei, pair_idx,
+                        avgby_idx, cluster_idx, effect, resid0, n,
+                        cwp, cw, sdv, sw, atv, rs)
     end
-    
+
     return E
 end
 
