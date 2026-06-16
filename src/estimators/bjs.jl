@@ -256,22 +256,24 @@ function fit_bjs(df::DataFrame;
     maxiter::Int = 1000,
     autosample::Bool = true,
     verbose::Bool = false,
-    multithreaded::Bool = true   # currently inert: both paths use fit_bjs_mt (see note below)
+    multithreaded::Bool = true   # selects threaded orthogonalization (see note)
     )
 
-    # NOTE: `multithreaded` is retained for backwards compatibility but is
-    # currently a no-op — the previous "single-threaded" path (`fit_bjs_st`)
-    # was a redundant, slower reimplementation of the same computation, so it
-    # was removed and both values route to `fit_bjs_mt`. (Despite its name,
-    # `fit_bjs_mt` is itself single-threaded today; a genuinely multithreaded
-    # implementation is planned, at which point this flag will select it.)
+    # `multithreaded` selects whether the influence-weight orthogonalization runs
+    # multithreaded. It parallelizes over disjoint work (FE groups / W columns),
+    # so results are identical to the serial path — only the wall-clock changes,
+    # and only when Julia is started with multiple threads. The cluster-score and
+    # `reg`-driven steps stay serial. (The previous `fit_bjs_st` path was a
+    # redundant, slower reimplementation and was removed; both paths now share
+    # `fit_bjs_mt`.)
     return fit_bjs_mt(df;
         y=y, id=id, t=t, g=g,
         controls=controls, fe=fe, weights=weights,
         cluster=cluster, horizons=horizons, pretrends=pretrends,
         project=project, hetby=hetby, minn=minn,
         avgeffectsby=avgeffectsby, control_type=control_type,
-        tol=tol, maxiter=maxiter, autosample=autosample, verbose=verbose
+        tol=tol, maxiter=maxiter, autosample=autosample, verbose=verbose,
+        threaded=multithreaded
     )
 end
 

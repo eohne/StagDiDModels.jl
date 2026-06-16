@@ -431,7 +431,8 @@ function fit_bjs_mt(df::DataFrame;
     tol::Float64 = 1e-6,
     maxiter::Int = 1000,
     autosample::Bool = true,
-    verbose::Bool = false
+    verbose::Bool = false,
+    threaded::Bool = false
     )
     if avgeffectsby === nothing
         avgeffectsby = [g, t]
@@ -666,7 +667,8 @@ function fit_bjs_mt(df::DataFrame;
         touse_sym = :__touse,
         tol = tol,
         maxiter = maxiter,
-        verbose=verbose
+        verbose=verbose,
+        threaded=threaded
     )
     
     #=== 9. Setup cluster structure ===#
@@ -819,66 +821,62 @@ function build_fe_structure(
 end
 
 
+# Orthogonalize all columns of W against one FE group. Local scalars only, so
+# distinct groups (which own disjoint rows) can run concurrently with no races.
+@inline function _fe_update_group!(W, group_indices, dg::Float64,
+                                   donors, wei, gi::Int, k::Int)
+    dg <= 1e-14 && return nothing
+    all_idxs = group_indices[gi]
+    @inbounds for j in 1:k
+        num = 0.0
+        for i in all_idxs
+            num += wei[i] * W[i, j]
+        end
+        proj = num / dg
+        for i in all_idxs
+            if donors[i]
+                W[i, j] -= proj
+            end
+        end
+    end
+    return nothing
+end
+
 """
 Update weights using pre-computed FE structure. Zero allocations.
+When `threaded`, parallelizes over FE groups: groups partition the rows, so each
+task writes a disjoint slice of `W` — race-free, identical result, no extra
+allocation.
 """
 function update_weights_fe_fast!(
     W::AbstractMatrix{<:Real},
     fe_struct::FEStructure,
     donors::AbstractVector{Bool},
-    wei::AbstractVector{<:Real}
+    wei::AbstractVector{<:Real};
+    threaded::Bool=false
     )
     n, k = size(W)
-    n_groups = length(fe_struct.group_indices)
-    
-    # No threading - the overhead isn't worth it for typical k
-    @inbounds for gi in 1:n_groups
-        dg = fe_struct.group_denoms[gi]
-        if dg <= 1e-14
-            continue
+    gidx = fe_struct.group_indices
+    gden = fe_struct.group_denoms
+    n_groups = length(gidx)
+    if threaded
+        Threads.@threads for gi in 1:n_groups
+            _fe_update_group!(W, gidx, gden[gi], donors, wei, gi, k)
         end
-        
-        all_idxs = fe_struct.group_indices[gi]
-        
-        for j in 1:k
-            # Numerator: sum over ALL observations in group
-            num = 0.0
-            for i in all_idxs
-                num += wei[i] * W[i, j]
-            end
-            proj = num / dg
-            
-            # Update: only donors
-            for i in all_idxs
-                if donors[i]
-                    W[i, j] -= proj
-                end
-            end
+    else
+        for gi in 1:n_groups
+            _fe_update_group!(W, gidx, gden[gi], donors, wei, gi, k)
         end
     end
-    
     return nothing
 end
 
 
-"""
-Update weights for a control variable. Zero allocations.
-"""
-function update_weights_control_fast!(
-    W::AbstractMatrix{<:Real},
-    x_dm::AbstractVector{<:Real},
-    denom::Float64,
-    donors::AbstractVector{Bool},
-    touse::AbstractVector{Bool},
-    wei::AbstractVector{<:Real}
-    )
-    if denom <= 1e-14
-        return nothing
-    end
-    
-    n, k = size(W)
-    
-    @inbounds for j in 1:k
+# Orthogonalize one column of W against a control. Distinct columns are
+# independent, so the column loop parallelizes with no races.
+@inline function _control_update_col!(W, x_dm, denom::Float64,
+                                      donors, touse, wei, j::Int, n::Int)
+    @inbounds begin
         num = 0.0
         for i in 1:n
             if touse[i]
@@ -886,14 +884,41 @@ function update_weights_control_fast!(
             end
         end
         β = num / denom
-        
         for i in 1:n
             if donors[i] && touse[i]
                 W[i, j] -= β * x_dm[i]
             end
         end
     end
-    
+    return nothing
+end
+
+"""
+Update weights for a control variable. Zero allocations.
+When `threaded`, parallelizes over columns of `W` (each column independent).
+"""
+function update_weights_control_fast!(
+    W::AbstractMatrix{<:Real},
+    x_dm::AbstractVector{<:Real},
+    denom::Float64,
+    donors::AbstractVector{Bool},
+    touse::AbstractVector{Bool},
+    wei::AbstractVector{<:Real};
+    threaded::Bool=false
+    )
+    if denom <= 1e-14
+        return nothing
+    end
+    n, k = size(W)
+    if threaded
+        Threads.@threads for j in 1:k
+            _control_update_col!(W, x_dm, denom, donors, touse, wei, j, n)
+        end
+    else
+        for j in 1:k
+            _control_update_col!(W, x_dm, denom, donors, touse, wei, j, n)
+        end
+    end
     return nothing
 end
 
@@ -912,7 +937,8 @@ function compute_influence_weights_mt!(
     touse_sym::Union{Nothing,Symbol}=nothing,
     tol::Float64=1e-6,
     maxiter::Int=1000,
-    verbose::Bool=false
+    verbose::Bool=false,
+    threaded::Bool=false
     )
     n = nrow(df)
     k = length(wtr_syms)
@@ -974,8 +1000,9 @@ function compute_influence_weights_mt!(
         fe_structures[fi] = build_fe_structure(fe_vec, donors, touse, wei)
     end
     
-    # Pre-allocate W_old
+    # Pre-allocate W_old and a per-column change accumulator (threaded reduction)
     W_old = similar(W)
+    col_change = Vector{Float64}(undef, k)
     
     # === ITERATION LOOP - NO ALLOCATIONS ===
     iter = 0
@@ -985,25 +1012,39 @@ function compute_influence_weights_mt!(
         
         # 1) Simple controls
         for ci in 1:length(controls)
-            update_weights_control_fast!(W, dm_controls[ci], control_denoms[ci], 
-                                         donors, touse, wei)
+            update_weights_control_fast!(W, dm_controls[ci], control_denoms[ci],
+                                         donors, touse, wei; threaded=threaded)
         end
-        
+
         # 2) Fixed effects
         for fi in 1:length(fe_syms)
-            update_weights_fe_fast!(W, fe_structures[fi], donors, wei)
+            update_weights_fe_fast!(W, fe_structures[fi], donors, wei; threaded=threaded)
         end
-        
-        # 3) Convergence check
-        total_change = 0.0
-        @inbounds for j in 1:k
-            for i in 1:n
-                if donors[i] && touse[i]
-                    total_change += abs(W[i, j] - W_old[i, j])
+
+        # 3) Convergence check (parallel reduction over columns when threaded)
+        total_change = if threaded
+            Threads.@threads for j in 1:k
+                c = 0.0
+                @inbounds for i in 1:n
+                    if donors[i] && touse[i]
+                        c += abs(W[i, j] - W_old[i, j])
+                    end
+                end
+                col_change[j] = c
+            end
+            sum(col_change)
+        else
+            tc = 0.0
+            @inbounds for j in 1:k
+                for i in 1:n
+                    if donors[i] && touse[i]
+                        tc += abs(W[i, j] - W_old[i, j])
+                    end
                 end
             end
+            tc
         end
-        
+
         if total_change <= tol
             break
         end
