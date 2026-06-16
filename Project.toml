@@ -1,7 +1,7 @@
 name = "StagDiDModels"
 uuid = "f3ca54ac-a19f-4bec-bcb5-33c111799ce9"
 authors = ["Elias Ohneberg <elias.ohneberg@gmail.com>"]
-version = "0.1.3"
+version = "0.1.4"
 
 [deps]
 CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
