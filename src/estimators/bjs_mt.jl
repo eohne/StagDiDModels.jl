@@ -40,7 +40,7 @@ function compute_cluster_scores_pretrends_mt!(
     
     # Create donor subset with original row indices
     donor_global_idx = findall(donor_mask)
-    d_donors = copy(d[donor_mask, :])
+    d_donors = d[donor_mask, :]   # already a fresh copy; no extra copy() needed
     d_donors[!, :__orig_row] = donor_global_idx
     n_donors = nrow(d_donors)
     
@@ -260,7 +260,7 @@ function compute_cluster_scores_controls_mt!(
     end
     
     donor_global_idx = findall(donor_mask)
-    d_donors = copy(d[donor_mask, :])
+    d_donors = d[donor_mask, :]   # already a fresh copy; no extra copy() needed
     d_donors[!, :__orig_row] = donor_global_idx
     n_donors = nrow(d_donors)
     
@@ -1058,6 +1058,25 @@ function compute_influence_weights_mt!(
 end
 
 
+# Map a column's distinct values to dense integer codes 1..nlevels, in
+# first-appearance order. Type-stable via the column's concrete eltype, so it
+# avoids the boxing/string allocations of a generic grouping.
+function _factorize(col::AbstractVector)
+    n = length(col)
+    lvl = Dict{eltype(col), Int}()
+    codes = Vector{Int}(undef, n)
+    nc = 0
+    @inbounds for i in 1:n
+        v = col[i]
+        c = get(lvl, v, 0)
+        if c == 0
+            nc += 1; c = nc; lvl[v] = c
+        end
+        codes[i] = c
+    end
+    return codes, nc
+end
+
 """
 Compute cluster scores for tau coefficients.
 All indexing pre-computed, zero allocations in main loop.
@@ -1096,25 +1115,27 @@ function compute_cluster_scores_tau_mt!(
         cluster_idx[i] = cluster_idx_map[cluster_vec[i]]
     end
     
-    # Avgby index for each observation
-    avgby_strings = Vector{String}(undef, n)
-    for i in 1:n
-        parts = String[]
-        for s in avgeffectsby
-            push!(parts, string(d[i, s]))
+    # Avgby group index for each observation. Factorize each grouping column to
+    # dense integer codes and fold them together with an integer-keyed Dict —
+    # this replaces a String-per-observation grouping (a major allocation source
+    # and the single biggest hotspot in this kernel). The partition is identical,
+    # so downstream results are unchanged.
+    avgby_idx, n_avgby = _factorize(d[!, avgeffectsby[1]])
+    for ci in 2:length(avgeffectsby)
+        codes, _ = _factorize(d[!, avgeffectsby[ci]])
+        combined = Dict{Tuple{Int,Int}, Int}()
+        ng = 0
+        @inbounds for i in 1:n
+            key = (avgby_idx[i], codes[i])
+            g = get(combined, key, 0)
+            if g == 0
+                ng += 1; g = ng; combined[key] = g
+            end
+            avgby_idx[i] = g
         end
-        avgby_strings[i] = join(parts, "_")
+        n_avgby = ng
     end
-    
-    unique_avgby = unique(avgby_strings)
-    avgby_to_int = Dict{String, Int}(s => i for (i, s) in enumerate(unique_avgby))
-    n_avgby = length(unique_avgby)
-    
-    avgby_idx = Vector{Int}(undef, n)
-    @inbounds for i in 1:n
-        avgby_idx[i] = avgby_to_int[avgby_strings[i]]
-    end
-    
+
     # (cluster, avgby) pair index
     pair_to_int = Dict{Tuple{Int,Int}, Int}()
     next_pair = 1
