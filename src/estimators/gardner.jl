@@ -429,41 +429,56 @@ function fit_gardner_dynamic(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g:
     first_u = copy(d[!, :ytilde]) .* w   
     first_u[treated_mask] .= 0.0
 
-    # Cross products
-    X2TX2 = Matrix(X2w' * X2w)
-    X1TX2 = Matrix(X1w' * X2w)
-    X10TX10 = Matrix(X10w' * X10w)
+    # Cross products. Keep the FE Gram (X10'X10) SPARSE: densifying it costs
+    # O(p²) memory and the old dense solve was O(p³) in the number of FE levels p
+    # (≈ #units + #periods), which is what made this blow up with the panel size.
+    # k (the number of event-time coefficients) is small, so the others are cheap.
+    X2TX2  = Matrix(X2w' * X2w)            # k×k
+    X1TX2  = Matrix(X1w' * X2w)            # p×k (dense, small k)
+    X10TX10 = X10w' * X10w                 # p×p, SPARSE (FE Gram)
 
-    # Matrix inverses
     inv_X2TX2 = try
         inv(cholesky(Symmetric(X2TX2)))
     catch
         pinv(X2TX2)
     end
 
-    # Influence function
-    IF_ss = inv_X2TX2 * transpose(X2w .* second_u)  
+    IF_ss = inv_X2TX2 * transpose(X2w .* second_u)            # k×n
 
-    solve_term = try
-        X10TX10 \ X1TX2  
-    catch
-        pinv(X10TX10) * X1TX2
+    # solve_term = (X10'X10)⁻¹ (X1'X2). The two-way-FE design is rank-deficient by
+    # one (the usual id/time collinearity), but solve_term enters the influence
+    # function only as solve_term' * X10w[i, :], which annihilates the null space —
+    # so the result is invariant to which particular solution is chosen. Solve the
+    # sparse system with a Cholesky on a tiny ridge (stable, exploits FE sparsity);
+    # fall back to the dense solve if anything degenerate occurs.
+    solve_term = let A = X10TX10
+        λ = 1e-9 * (sum(diag(A)) / size(A, 1))
+        try
+            cholesky(Symmetric(A + λ * I)) \ X1TX2            # p×k, sparse CHOLMOD
+        catch
+            Matrix(A) \ X1TX2                                  # dense fallback
+        end
     end
 
-    temp_matrix = transpose(X10w .* first_u)  
-    IF_fs = inv_X2TX2 * transpose(solve_term) * temp_matrix  
+    temp_matrix = transpose(X10w .* first_u)                  # p×n (sparse)
+    IF_fs = inv_X2TX2 * transpose(solve_term) * temp_matrix   # k×n
+    IF = IF_fs .- IF_ss                                       # k×n
 
-    # Total IF
-    IF = IF_fs .- IF_ss  
-
-    # Cluster robust variance
+    # Cluster-robust variance. Single pass over observations (the old code did an
+    # O(#clusters × n) `findall` per cluster). First-appearance cluster ordering
+    # and ascending-i accumulation reproduce the previous per-cluster sums exactly.
     cl = d[!, cluster]
-    cluster_ids = unique(cl)
-    cluster_sums = zeros(Float64, size(IF, 1), length(cluster_ids))
-
-    for (i, cid) in enumerate(cluster_ids)
-        obs_idx = findall(cl .== cid)
-        cluster_sums[:, i] = sum(IF[:, obs_idx], dims=2)
+    cluster_index = Dict{eltype(cl), Int}()
+    G = 0
+    @inbounds for c in cl
+        if !haskey(cluster_index, c)
+            G += 1; cluster_index[c] = G
+        end
+    end
+    cluster_sums = zeros(Float64, size(IF, 1), G)
+    @inbounds for i in 1:length(cl)
+        col = cluster_index[cl[i]]
+        @views cluster_sums[:, col] .+= IF[:, i]
     end
 
     Σ = cluster_sums * cluster_sums'

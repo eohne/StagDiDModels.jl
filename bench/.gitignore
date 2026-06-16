@@ -1,5 +1,9 @@
-# Generated benchmark artifacts — regenerate with run_bench_julia.jl / bench_stata.do
+# Generated benchmark artifacts — regenerate with the harness scripts
 data_*.csv
 results_*.csv
 results_*.dta
 *.log
+*.jls
+gpanel.csv
+gardner_julia_se.csv
+gnames.txt
