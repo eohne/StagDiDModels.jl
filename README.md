@@ -14,7 +14,7 @@ StagDiDModels.jl implements some of the recent advances in difference-in-differe
 | Estimator | Function | Reference |
 |-----------|----------|-----------|
 | BJS Imputation | `fit_bjs()` | Borusyak, Jaravel, Spiess (2023) |
-| Gardner Two-Stage | `fit_gardner2s_static()`, `fit_gardner_dynamic()` | Gardner (2021) |
+| Gardner Two-Stage | `fit_gardner_static()`, `fit_gardner_dynamic()` | Gardner (2021) |
 | Sun-Abraham | `fit_sunab()` | Sun & Abraham (2021) |
 | TWFE | `fit_twfe_static()`, `fit_twfe_dynamic()` | Standard approach |
 
@@ -514,14 +514,18 @@ All estimator functions accept:
 - `hetby::Union{Nothing,Symbol}`: Discrete treatment effect heterogeneity, the Stata `hetby()` option (default: `nothing`)
 - `minn::Real`: Minimum effective sample size per coefficient. `0` keeps everything, `30` matches Stata's default (default: `0`)
 
-## R Package Equivalents
+## R / Stata Equivalents
 
-| Julia | R | STATA |
-|-------|---|-------|
-| `fit_bjs_imputation()` | - | did_imputation |
-| `fit_did2s_static()` | `did2s::did2s()` |
-| `fit_sunab()` | `fixest::feols(y ~ sunab(g, t) \| id + t)` | - |
-| `fit_twfe_dynamic()` | `fixest::feols(y ~ i(event_time) \| id + t)` | - |
+| StagDiDModels.jl | R | Stata |
+|------------------|---|-------|
+| `fit_bjs`, `fit_bjs_dynamic`, `fit_bjs_static` | `didimputation::did_imputation` † | `did_imputation` |
+| `fit_gardner_dynamic`, `fit_gardner_static` | `did2s::did2s` | — |
+| `fit_sunab` | `fixest::feols(y ~ sunab(g, t) \| id + t)` | — |
+| `fit_twfe_dynamic`, `fit_twfe_static` | `fixest::feols(y ~ i(event_time) \| id + t)` | — |
+
+† The R `didimputation` package reports conservative standard errors (it omits the
+influence-function variance) and lacks the `hetby` / `project` options;
+`StagDiDModels` follows the Stata `did_imputation` implementation. See [Performance](#performance).
 
 
 ## Performance
