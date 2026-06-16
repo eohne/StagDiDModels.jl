@@ -1,0 +1,5 @@
+# Generated benchmark artifacts — regenerate with run_bench_julia.jl / bench_stata.do
+data_*.csv
+results_*.csv
+results_*.dta
+*.log
