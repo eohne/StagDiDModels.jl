@@ -17,7 +17,7 @@ struct TWFEModel <: RegressionModel
     adjr2::Float64                  # adj R² from second stage (residualized outcome)
     n_post::Int                  # number of treated observations
     n_pre::Int                   # number of donor observations
-    cluster::Symbol                 # Cluster var
+    cluster::Vector{Symbol}      # clustering variable(s); empty == robust SEs
 end
 
 for ModelType in [:TWFEModel]
@@ -108,7 +108,7 @@ function top(m::TWFEModel)
             "Pre obs" sprint(show, m.n_pre, context = :compact => true);
             "F-statistic" sprint(show, fstatistic(m)[1], context = :compact => true);
             "Outcome" sprint(show, m.y_name, context = :compact => true);
-            "Cluster" sprint(show,m.cluster, context = :compact => true);
+            "Cluster" _cluster_show(m.cluster);
             ]
     return out
 end
@@ -189,9 +189,9 @@ function TWFEModel(β::AbstractVector, Σ::AbstractMatrix, names::AbstractVector
                       adjr2::Float64 = 0.0,
                       n_post::Int = 0,
                       n_pre::Int = 0,
-                      cluster::Symbol = :none)
-    
+                      cluster = Symbol[])
+
     return TWFEModel(β, Σ, names, nobs, dof_resid, y_name, estimator_type,
-                        treatment_periods,r2, adjr2, 
-                        n_post, n_pre, cluster)
+                        treatment_periods,r2, adjr2,
+                        n_post, n_pre, _clustervec(cluster))
 end

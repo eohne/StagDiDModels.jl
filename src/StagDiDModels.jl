@@ -29,6 +29,41 @@ export TWFEModel, BJSModel, SunabModel, GardnerModel
 # reexport:
 export responsename, coef, vcov, coefnames, nobs, dof_residual, dof, stderror, pvalue, confint,r2, islinear, adjr2, coeftable,show
 
+# Cluster / SE-type accessors, uniform across all four model types. Mirrors how
+# FixedEffectModels exposes its fitted vcov so downstream packages (table
+# builders, etc.) can render "Std. errors" and "Cluster" rows generically.
+const _DiDModel = Union{TWFEModel, BJSModel, SunabModel, GardnerModel}
+
+"""
+    clustervars(m) -> Vector{Symbol}
+
+Clustering variable(s) used for the model's standard errors. Empty when the SEs
+are heteroskedasticity-robust (unclustered). BJS and Gardner return at most one
+variable; TWFE and Sunab may return several (multiway clustering).
+"""
+clustervars(m::_DiDModel) = m.cluster
+
+"""
+    se_type(m) -> Symbol
+
+Standard-error type: `:cluster` when [`clustervars`](@ref) is non-empty,
+otherwise `:robust`.
+"""
+se_type(m::_DiDModel) = isempty(m.cluster) ? :robust : :cluster
+
+"""
+    vcov_type(m) -> Vcov.CovarianceEstimator
+
+The covariance estimator behind the model's standard errors, in the same
+vocabulary FixedEffectModels uses on its `vcov_type` field: `Vcov.cluster(vars...)`
+when clustered, otherwise `Vcov.robust()`. Lets vcov-aware consumers classify the
+SE type exactly as they would a `FixedEffectModel`
+(`vt isa Vcov.ClusterCovariance` / `Vcov.RobustCovariance`).
+"""
+vcov_type(m::_DiDModel) = isempty(m.cluster) ? Vcov.robust() : Vcov.cluster(m.cluster...)
+
+export clustervars, se_type, vcov_type
+
 # utils
 include("utils/quiet_reg.jl")
 include("utils/preprocess.jl")

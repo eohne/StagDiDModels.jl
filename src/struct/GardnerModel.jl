@@ -20,7 +20,7 @@ struct GardnerModel <: RegressionModel
     n_treated::Int                  # number of treated observations
     n_donors::Int                   # number of donor observations
     control_type::Symbol            # :notyet or :never
-    cluster::Symbol                 # Cluster var
+    cluster::Vector{Symbol}         # clustering variable(s); empty == robust SEs
 end
 
 #=============================================================================
@@ -114,7 +114,7 @@ function top(m::GardnerModel)
             "Donor obs" sprint(show, m.n_donors, context = :compact => true);
             "F-statistic" sprint(show, fstatistic(m)[1], context = :compact => true);
             "Outcome" sprint(show, m.y_name, context = :compact => true);
-            "Cluster " sprint(show, m.cluster, context = :compact => true);
+            "Cluster " _cluster_show(m.cluster);
             ]
     return out
 end
@@ -197,9 +197,9 @@ function GardnerModel(β::AbstractVector, Σ::AbstractMatrix, names::AbstractVec
                       n_treated::Int = 0,
                       n_donors::Int = 0,
                       control_type::Symbol = :notyet,
-                      cluster = :none)
-    
+                      cluster = Symbol[])
+
     return GardnerModel(β, Σ, names, nobs, dof_resid, y_name, estimator_type,
-                        treatment_periods, first_stage_r2,second_stage_r2, second_stage_adjr2, 
-                        n_treated, n_donors, control_type, cluster)
+                        treatment_periods, first_stage_r2,second_stage_r2, second_stage_adjr2,
+                        n_treated, n_donors, control_type, _clustervec(cluster))
 end

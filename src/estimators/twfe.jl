@@ -28,7 +28,8 @@ y_it ~ Σ_{τ≠ ref_p} 1{t-g=τ} + controls + FE(id) + FE(t)
 # Keyword Arguments
 
 * `controls::Vector{Symbol}`: additional covariates (no FE here).
-* `cluster`: one-way cluster key (e.g., `:id`, `:firm`), or `nothing`.
+* `cluster`: cluster key (e.g., `:id`, `:firm`), a tuple/vector for multiway
+  clustering (e.g., `(:firm, :month)`), or `nothing` for robust SEs.
 * `ref_p`: omitted pre-period τ (default `-1`).
 * `bin_leads`: bin all τ ≤ `-bin_leads` into that single lead (optional).
 * `bin_lags`: bin all τ ≥ `bin_lags` into that single lag (optional).
@@ -89,8 +90,8 @@ function fit_twfe_dynamic(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Sy
     vc = build_cluster_vcov(cluster)
     m = reg(d, f, vc; weights=weights)
     TWFEModel(coef(m), vcov(m), coefnames(m), nobs(m), dof_residual(m), y, :dynamic,
-                        sort(event_times_to_include),r2(m), adjr2(m), 
-                        sum(d[:,:ttt].>=0), sum(d[:,:ttt].<0), isnothing(cluster) ? :none : cluster)
+                        sort(event_times_to_include),r2(m), adjr2(m),
+                        sum(d[:,:ttt].>=0), sum(d[:,:ttt].<0), _clustervec(cluster))
 end
 
 
@@ -151,6 +152,6 @@ function fit_twfe_static(df::DataFrame; y::Symbol, id::Symbol, t::Symbol, g::Sym
     
     m=reg(d, f, vc; weights=wv)
         TWFEModel(coef(m), vcov(m), coefnames(m), nobs(m), dof_residual(m), y, :static,
-                        Int[],r2(m), adjr2(m), 
-                        sum(d[:,:_ATT].>0), sum(d[:,:_ATT].==0),isnothing(cluster) ? :none : cluster)
+                        Int[],r2(m), adjr2(m),
+                        sum(d[:,:_ATT].>0), sum(d[:,:_ATT].==0), _clustervec(cluster))
 end

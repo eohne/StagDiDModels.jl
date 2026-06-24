@@ -207,14 +207,20 @@ its analytic influence-function variance estimation.
     - `true` → all negative horizons (τ < 0)
     - `Int` → number of pre-periods (e.g., `5` means K=-1 to K=-5)
     - `Vector{Int}` → specific pre-horizons
-- `project::Vector{Symbol} = Symbol[]`: Continuous treatment-effect heterogeneity
-    (Stata `project()`). Reports the coefficients of an OLS projection of the
-    individual effects on these covariates: an intercept `τ_cons` plus a slope
-    `τ_<var>` per covariate (per horizon when combined with `horizons`). A positive,
-    significant slope means the effect grows with that covariate. Cannot be combined with `hetby`.
-- `hetby::Union{Nothing,Symbol} = nothing`: Discrete treatment-effect heterogeneity
-    (Stata `hetby()`). Reports a separate effect for each value of this variable
-    (≤30 values), named `τ_<value>` (or `τ<h>_<value>` per horizon). Cannot be combined with `project`.
+- `project::Vector{Symbol} = Symbol[]`: **Continuous** treatment-effect
+    heterogeneity (Stata `project()`). Use this when you care how the effect
+    *varies with* one or more (typically continuous) covariates rather than its
+    average. Instead of a weighted mean of the imputed individual effects
+    `τ̂ = Y - Ŷ(0)`, it reports the coefficients of a (weighted) OLS projection
+    `τ̂ ≈ β₀ + β₁x₁ + …`: an intercept (`_cons`) plus one slope per covariate. A
+    positive, significant slope means the effect grows with that covariate. Works
+    with `horizons` (applied per horizon — see *Returns*). Cannot be combined with
+    `hetby`.
+- `hetby::Union{Nothing,Symbol} = nothing`: **Discrete** treatment-effect
+    heterogeneity (Stata `hetby()`). Use this to get a separate average effect for
+    each subgroup defined by a categorical variable (≤30 distinct values among the
+    treated). Works with `horizons` (applied per horizon — see *Returns*). Cannot
+    be combined with `project`.
 - `minn::Real = 0`: Minimum effective sample size per coefficient (Stata `minn`, but
     defaulting to `0` = off for backward compatibility). When `> 0`, coefficients whose
     effective sample size `1/HHI` falls below `minn` are suppressed with a warning.
@@ -229,12 +235,34 @@ its analytic influence-function variance estimation.
 - `multithreaded::Bool = true`: whether to multithread or not.
 
 # Returns
-`BJSModel` object.
+A `BJSModel`. Its coefficient vector (`coef(m)` / `coefnames(m)`) is laid out in
+three blocks, in this order:
+
+1. **Pre-trends** — one coefficient per requested negative horizon, named
+   `τ::-1`, `τ::-2`, … (controlled by `pretrends`). These are a falsification
+   check on the imputation model and are **always the standard per-horizon
+   estimates**; they are *not* split or reshaped by `project` or `hetby`.
+2. **Treatment effects** — the post-period block. Its shape depends on the
+   options (`h` denotes a post-treatment horizon):
+
+   | mode             | static (`horizons=nothing`) | dynamic (`horizons` set)              |
+   |------------------|-----------------------------|---------------------------------------|
+   | plain            | `_ATT`                      | `τ::0`, `τ::1`, …                      |
+   | `project=[:x]`   | `τ_cons`, `τ_x`             | `τ0_cons`, `τ0_x`, `τ1_cons`, `τ1_x`, …|
+   | `hetby=:grp`     | one `τ_<val>` per subgroup  | one `τ<h>_<val>` per horizon × subgroup|
+
+3. **Controls** — one coefficient per surviving control (only if `controls` given).
+
+So `project`/`hetby` reshape **only** the post-period block; the pre-trend
+coefficients are identical to a plain fit. Everything is accessible through the
+standard StatsAPI interface: `coef`, `coefnames`, `vcov`, `stderror`, `confint`,
+`coeftable`.
 
 # Notes
 - Never-treated units: code as `missing` or `0` in `g`
 - Time variable must be integer-coded
 - When `autosample=true`, observations where FE cannot be imputed are dropped with a warning.
+- `project` and `hetby` are mutually exclusive (passing both errors).
 """
 function fit_bjs(df::DataFrame;
     y::Symbol,
@@ -284,6 +312,15 @@ end
 
 Static ATT estimator using Borusyak, Jaravel, and Spiess (2023) imputation.
 Wrapper for `fit_bjs(...; horizons=nothing, pretrends=nothing)`.
+
+Returns a single `_ATT` coefficient by default. Heterogeneity options are
+supported and reshape that single effect:
+- `project::Vector{Symbol}`: continuous heterogeneity → an intercept `τ_cons`
+  plus a slope `τ_<var>` per covariate (OLS projection of the individual effects).
+- `hetby::Symbol`: discrete heterogeneity → one `τ_<value>` per subgroup (≤30).
+
+`project` and `hetby` cannot be combined. See [`fit_bjs`](@ref) for the full
+description of these options, `minn`, and the returned coefficient layout.
 """
 function fit_bjs_static(df::DataFrame;
     y::Symbol,
@@ -323,6 +360,16 @@ end
 
 Dynamic event-study estimator using Borusyak, Jaravel, and Spiess (2023) imputation.
 Wrapper for `fit_bjs` with `horizons=true` and `pretrends=true` by default.
+
+Returns per-horizon post-treatment effects (`τ::0`, `τ::1`, …) plus pre-trend
+coefficients (`τ::-1`, `τ::-2`, …). `project` and `hetby` work here too and are
+applied **per horizon**:
+- `project::Vector{Symbol}` → `τ0_cons`, `τ0_<var>`, `τ1_cons`, `τ1_<var>`, …
+- `hetby::Symbol` → one `τ<h>_<value>` per horizon × subgroup.
+
+In both cases the **pre-trend coefficients are returned unchanged** (one per
+negative horizon) — heterogeneity only reshapes the post-period effects. The two
+options cannot be combined. See [`fit_bjs`](@ref) for full details.
 """
 function fit_bjs_dynamic(df::DataFrame;
     y::Symbol,

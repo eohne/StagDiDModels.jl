@@ -19,7 +19,7 @@ struct BJSModel <: RegressionModel
     n_treated::Int                  # number of treated observations
     n_donors::Int                   # number of donor observations
     control_type::Symbol            # :notyet or :never
-    cluster::Symbol                 # Cluster var
+    cluster::Vector{Symbol}         # clustering variable(s); empty == robust SEs
 end
 
 
@@ -98,7 +98,7 @@ function top(m::BJSModel)
             "R² First Stage" @sprintf("%.3f",m.first_stage_r2);
             ]
     out= vcat(out,[
-        "Cluster" sprint(show, m.cluster,context = :compact => true)]) 
+        "Cluster" _cluster_show(m.cluster)])
 
     return out
 end
@@ -175,10 +175,10 @@ function BJSModel(β::AbstractVector, Σ::AbstractMatrix, names::AbstractVector,
                   treatment_periods::Vector{Int} = Int[],
                   first_stage_r2::Float64 = 0.0,
                   n_treated::Int = 0,
-                  n_donors::Int = 0, 
+                  n_donors::Int = 0,
                   control_type::Symbol = :notyet,
-                  cluster::Symbol = :none)
-    
+                  cluster = Symbol[])
+
     return BJSModel(β, Σ, names, nobs, dof_resid, y_name, estimator_type,
-                    treatment_periods, first_stage_r2, n_treated, n_donors, control_type,cluster)
+                    treatment_periods, first_stage_r2, n_treated, n_donors, control_type, _clustervec(cluster))
 end

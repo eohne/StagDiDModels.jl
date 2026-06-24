@@ -4,6 +4,60 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.5]
+
+### Added
+- Exported accessors `clustervars`, `se_type`, and `vcov_type`, defined uniformly
+  for all four model types (`TWFEModel`, `SunabModel`, `GardnerModel`, `BJSModel`).
+  `clustervars(m)` returns the clustering variable(s) (empty when standard errors
+  are robust/unclustered), `se_type(m)` returns `:robust` or `:cluster`, and
+  `vcov_type(m)` returns the same `Vcov.*` object FixedEffectModels exposes on its
+  `vcov_type` field. This lets table builders and other tooling detect the
+  standard-error type and cluster variables generically.
+
+### Fixed
+- Multiway (e.g. two-way) clustering now works end to end for `fit_twfe_static`,
+  `fit_twfe_dynamic`, and `fit_sunab`. Passing `cluster=(:a, :b)` (or a vector)
+  previously computed the correct covariance matrix but errored when constructing
+  the model; the result now stores every clustering variable. `fit_bjs` and the
+  Gardner estimators remain single-cluster by design.
+
+### Changed
+- Each model now stores its clustering variables as a `Vector{Symbol}` (empty =
+  robust) instead of a single `Symbol`. This is an internal representation change;
+  the `fit_*` signatures, numerical results, and the StatsAPI interface are
+  unchanged.
+- `cumulative_effects` now propagates the requested confidence level through to
+  its reported confidence intervals.
+
+### Documentation
+- Expanded the `fit_bjs`, `fit_bjs_static`, and `fit_bjs_dynamic` docstrings to
+  describe the `project` (continuous) and `hetby` (discrete) heterogeneity options
+  and when to use each, how they behave under `horizons` (per-horizon
+  coefficients, e.g. `τ0_cons`/`τ<h>_<value>`), the full layout of the returned
+  coefficient vector (pre-trends → treatment effects → controls), and the fact
+  that pre-trend coefficients are never reshaped by `project`/`hetby`.
+
+### Notes
+- Non-breaking: existing calls produce identical results.
+
+## [0.1.4]
+
+### Performance
+- Faster Gardner standard errors via a sparse fixed-effect Gram solve and
+  single-pass clustering.
+- Faster BJS estimation: hoisted scalar `DataFrame` indexing, function barriers,
+  integer-based cluster grouping, fewer redundant copies, and an optional threaded
+  influence-weight orthogonalization (identical results, lower wall-clock).
+- Added a precompilation workload to cut first-call latency.
+
+### Added
+- Stata `did_imputation` and cross-package benchmark harnesses.
+
+### Documentation
+- README updates: corrected the stated Stata parity (~1e-7/1e-8), fairer
+  idle-machine performance benchmarks, and fixed stale function names.
+
 ## [0.1.3]
 
 ### Added
