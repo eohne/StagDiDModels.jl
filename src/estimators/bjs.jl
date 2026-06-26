@@ -233,6 +233,13 @@ its analytic influence-function variance estimation.
                              be imputed from donor sample. If false, error.
 - `verbose::Bool = false`: If warnings should be printed. (e.g. dropping of singletons, collinear pretrends or controls)
 - `multithreaded::Bool = true`: whether to multithread or not.
+- `compute_ses::Bool = true`: when `false`, skip the (expensive) variance
+    estimation — the iterative influence-weight orthogonalization and per-cluster
+    score accumulation — and return only the point estimates. The covariance matrix
+    is filled with `NaN`, so `coef`/`coefnames` are valid while `vcov`/`stderror`/
+    `pvalue`/`confint` return `NaN`. Intended for tight loops (e.g. bootstrap /
+    placebo simulations) that need coefficients only; point estimates are identical
+    to a full fit.
 
 # Returns
 A `BJSModel`. Its coefficient vector (`coef(m)` / `coefnames(m)`) is laid out in
@@ -284,7 +291,8 @@ function fit_bjs(df::DataFrame;
     maxiter::Int = 1000,
     autosample::Bool = true,
     verbose::Bool = false,
-    multithreaded::Bool = true   # selects threaded orthogonalization (see note)
+    multithreaded::Bool = true,   # selects threaded orthogonalization (see note)
+    compute_ses::Bool = true
     )
 
     # `multithreaded` selects whether the influence-weight orthogonalization runs
@@ -301,7 +309,7 @@ function fit_bjs(df::DataFrame;
         project=project, hetby=hetby, minn=minn,
         avgeffectsby=avgeffectsby, control_type=control_type,
         tol=tol, maxiter=maxiter, autosample=autosample, verbose=verbose,
-        threaded=multithreaded
+        threaded=multithreaded, compute_ses=compute_ses
     )
 end
 
@@ -339,7 +347,8 @@ function fit_bjs_static(df::DataFrame;
     maxiter::Int = 1000,
     autosample::Bool = true,
     verbose::Bool = false,
-    multithreaded::Bool = true
+    multithreaded::Bool = true,
+    compute_ses::Bool = true
     )
 
     return fit_bjs(df; y=y, id=id, t=t, g=g,
@@ -348,7 +357,7 @@ function fit_bjs_static(df::DataFrame;
                    project=project, hetby=hetby, minn=minn,
                    control_type=control_type, tol=tol, maxiter=maxiter,
                    autosample=autosample,verbose=verbose,
-                   multithreaded = multithreaded)
+                   multithreaded = multithreaded, compute_ses=compute_ses)
 end
 
 
@@ -391,7 +400,8 @@ function fit_bjs_dynamic(df::DataFrame;
     maxiter::Int = 1000,
     autosample::Bool = true,
     verbose::Bool = false,
-    multithreaded::Bool = true)
+    multithreaded::Bool = true,
+    compute_ses::Bool = true)
 
     return fit_bjs(df; y=y, id=id, t=t, g=g,
                    controls=controls, fe=fe, weights=weights,
@@ -399,5 +409,5 @@ function fit_bjs_dynamic(df::DataFrame;
                    project=project, hetby=hetby, minn=minn,
                    avgeffectsby=avgeffectsby, control_type=control_type,
                    tol=tol, maxiter=maxiter, autosample=autosample,verbose=verbose,
-                   multithreaded = multithreaded)
+                   multithreaded = multithreaded, compute_ses=compute_ses)
 end

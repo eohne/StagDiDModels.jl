@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.6]
+
+### Added
+- `compute_ses` keyword for `fit_bjs`, `fit_bjs_dynamic`, and `fit_bjs_static`
+  (default `true`). With `compute_ses=false`, the estimator skips the expensive
+  variance estimation — the iterative influence-weight orthogonalization and
+  per-cluster score accumulation — and returns only point estimates. The
+  covariance matrix is filled with `NaN`, so `coef`/`coefnames` remain valid while
+  `vcov`/`stderror`/`pvalue`/`confint` return `NaN` (still StatsAPI-conformant).
+  Point estimates, including pre-trend and control coefficients, are identical to a
+  full fit. Intended for tight loops such as bootstrap / placebo simulations that
+  only need coefficients; on the bundled test data the dynamic estimator runs about
+  5x faster, with larger gains as the number of clusters/observations grows.
+
+### Notes
+- Non-breaking: `compute_ses` defaults to `true`, so existing calls are unchanged.
+
 ## [0.1.5]
 
 ### Added

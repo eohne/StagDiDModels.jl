@@ -18,7 +18,8 @@ function compute_cluster_scores_pretrends_mt!(
     weights::Union{Nothing,Symbol};
     y::Symbol,
     touse_sym::Symbol = :__touse,
-    verbose::Bool=false
+    verbose::Bool=false,
+    compute_ses::Bool=true
     )
     n = nrow(d)
     k_pre = length(pre_syms)
@@ -130,7 +131,13 @@ function compute_cluster_scores_pretrends_mt!(
     if k_valid == 0
         return zeros(Float64, G, 0), Float64[], Int[]
     end
-    
+
+    # Coefficients (pre_β) are now in hand; the per-pre-trend FWL residualization
+    # and cluster-score accumulation below are SE-only and skipped when off.
+    if !compute_ses
+        return zeros(Float64, G, 0), pre_β, valid_pre_idx
+    end
+
     # 2. Get preresid and map back to full dataset
     preresid_raw = residuals(m_pre)
     esample = m_pre.esample
@@ -240,7 +247,8 @@ function compute_cluster_scores_controls_mt!(
     imput_resid::Vector{Float64};
     y::Symbol,
     touse_sym::Symbol = :__touse,
-    verbose::Bool=false
+    verbose::Bool=false,
+    compute_ses::Bool=true
     )
     n = nrow(d)
     k_ctrl = length(controls)
@@ -344,7 +352,13 @@ function compute_cluster_scores_controls_mt!(
     if k_valid == 0
         return zeros(Float64, G, 0), Float64[], Symbol[]
     end
-    
+
+    # Control coefficients (β_ctrl) are done; the residualization + cluster-score
+    # loop below is SE-only and skipped when off.
+    if !compute_ses
+        return zeros(Float64, G, 0), β_ctrl, valid_ctrl_syms
+    end
+
     E_ctrl = zeros(Float64, G, k_valid)
     
     # Pre-extract control columns
@@ -432,7 +446,8 @@ function fit_bjs_mt(df::DataFrame;
     maxiter::Int = 1000,
     autosample::Bool = true,
     verbose::Bool = false,
-    threaded::Bool = false
+    threaded::Bool = false,
+    compute_ses::Bool = true
     )
     if avgeffectsby === nothing
         avgeffectsby = [g, t]
@@ -666,68 +681,70 @@ function fit_bjs_mt(df::DataFrame;
         end
     end
     
-    #=== 8. Compute influence weights for tau ===#
-    fe_syms = Symbol[fe...]
-    W_tau, iters = compute_influence_weights_mt!(
-        d, wtr_syms, controls, fe_syms, :D, weights;
-        touse_sym = :__touse,
-        tol = tol,
-        maxiter = maxiter,
-        verbose=verbose,
-        threaded=threaded
-    )
-    
-    #=== 9. Setup cluster structure ===#
+    #=== 9. Setup cluster structure (also needed for dof_resid) ===#
     cluster_vec = isnothing(cluster) ? collect(1:n) : d[!, cluster]
     cluster_ids = unique(cluster_vec)
     G = length(cluster_ids)
-    
-    #=== 10. Compute cluster scores for tau ===#
-    E_tau = compute_cluster_scores_tau_mt!(
-        d, wtr_syms, W_tau, wei, cluster_vec, cluster_ids, g, t;
-        treat_sym = :D,
-        avgeffectsby = avgeffectsby
-    )
-    
-    #=== 11. Compute cluster scores for pre-trends ===#
+
+    #=== 8 & 10. Influence weights + cluster scores for tau ===#
+    # These are the expensive part of the BJS variance estimator. With
+    # `compute_ses=false` they are skipped entirely (point estimates are
+    # unaffected); the vcov is filled with NaN below.
+    if compute_ses
+        fe_syms = Symbol[fe...]
+        W_tau, iters = compute_influence_weights_mt!(
+            d, wtr_syms, controls, fe_syms, :D, weights;
+            touse_sym = :__touse,
+            tol = tol,
+            maxiter = maxiter,
+            verbose=verbose,
+            threaded=threaded
+        )
+        E_tau = compute_cluster_scores_tau_mt!(
+            d, wtr_syms, W_tau, wei, cluster_vec, cluster_ids, g, t;
+            treat_sym = :D,
+            avgeffectsby = avgeffectsby
+        )
+    end
+
+    #=== 11. Pre-trend coefficients (+ cluster scores when compute_ses) ===#
     E_pre, β_pre, valid_pre_idx = compute_cluster_scores_pretrends_mt!(
         d, pre_syms, controls, fe, wei, cluster_vec, cluster_ids, cluster, weights;
         y = y,
         touse_sym = :__touse,
-        verbose=verbose
+        verbose=verbose,
+        compute_ses=compute_ses
     )
     k_pre = length(β_pre)
-    
-    #=== 11b. Compute cluster scores for controls ===#
+
+    #=== 11b. Control coefficients (+ cluster scores when compute_ses) ===#
     E_ctrl, β_ctrl, valid_ctrl_syms = compute_cluster_scores_controls_mt!(
-        d, controls, fe, wei, cluster_vec, cluster_ids, cluster, weights, 
+        d, controls, fe, wei, cluster_vec, cluster_ids, cluster, weights,
         d[!, :__imput_resid];
         y = y,
         touse_sym = :__touse,
-        verbose=verbose
+        verbose=verbose,
+        compute_ses=compute_ses
     )
     k_ctrl = length(β_ctrl)
     
-    #=== 12. Combine cluster scores and compute joint VCOV ===#
-    if k_pre > 0
-        E_pre_chron = E_pre[:, end:-1:1]
-        β_pre_chron = β_pre[end:-1:1]
-        valid_pre_idx_chron = valid_pre_idx[end:-1:1]
+    #=== 12. Assemble coefficients and the joint VCOV ===#
+    # Coefficients are reversed into chronological order regardless of `compute_ses`.
+    β_pre_chron = k_pre > 0 ? β_pre[end:-1:1] : Float64[]
+    valid_pre_idx_chron = k_pre > 0 ? valid_pre_idx[end:-1:1] : Int[]
+    all_β = k_ctrl > 0 ? vcat(β_pre_chron, β_tau, β_ctrl) : vcat(β_pre_chron, β_tau)
+
+    if compute_ses
+        E_pre_chron = k_pre > 0 ? E_pre[:, end:-1:1] : zeros(Float64, G, 0)
+        E_combined = k_ctrl > 0 ? hcat(E_pre_chron, E_tau, E_ctrl) :
+                                  hcat(E_pre_chron, E_tau)
+        Σ_full = transpose(E_combined) * E_combined
     else
-        E_pre_chron = zeros(Float64, G, 0)
-        β_pre_chron = Float64[]
-        valid_pre_idx_chron = Int[]
+        # SEs skipped: report a NaN covariance so stderror/pvalue/confint are NaN
+        # while coef/coefnames stay valid (StatsAPI-conformant).
+        kt = length(all_β)
+        Σ_full = fill(NaN, kt, kt)
     end
-    
-    if k_ctrl > 0
-        E_combined = hcat(E_pre_chron, E_tau, E_ctrl)
-        all_β = vcat(β_pre_chron, β_tau, β_ctrl)
-    else
-        E_combined = hcat(E_pre_chron, E_tau)
-        all_β = vcat(β_pre_chron, β_tau)
-    end
-    
-    Σ_full = transpose(E_combined) * E_combined
     
     #=== 13. Assemble names ===#
     tau_names = tau_display

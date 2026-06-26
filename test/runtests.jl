@@ -272,6 +272,31 @@ end
             i0b = findfirst(==("τ0_cons"), coefnames(m30))
             @test coef(m0)[i0a] ≈ coef(m30)[i0b] rtol=1e-8
         end
+
+        @testset "compute_ses=false returns coefficients only" begin
+            pdf = CSV.read(joinpath(@__DIR__, "bjs_testdata.csv"),
+                           DataFrame; missingstring = ["", "."])
+            # Across the static, dynamic, project, and controls paths, skipping the
+            # variance estimation must leave the point estimates (incl. pre-trends
+            # and control coefficients) bit-identical and suppress SEs to NaN.
+            for kw in ((;),
+                       (; horizons = true),
+                       (; horizons = true, project = [:X_regtrend]),
+                       (; horizons = true, controls = [:X_idio]))
+                full = fit_bjs(pdf; y=:Y, id=:id, t=:time, g=:Ei, cluster=:id, kw...)
+                fast = fit_bjs(pdf; y=:Y, id=:id, t=:time, g=:Ei, cluster=:id,
+                               compute_ses=false, kw...)
+                @test coefnames(fast) == coefnames(full)
+                @test coef(fast) == coef(full)
+                @test !any(isnan, coef(fast))
+                @test all(isnan, stderror(fast))
+                @test all(isnan, vcov(fast))
+                @test nobs(fast) == nobs(full)
+                @test dof_residual(fast) == dof_residual(full)
+                # show/coeftable must still render with NaN standard errors
+                @test length(sprint(show, fast)) > 0
+            end
+        end
     end
 
 end
